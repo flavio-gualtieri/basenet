@@ -1,0 +1,20 @@
+model:
+  encoder:
+    hitter:
+      hidden_dim: 64
+      num_layers: 3
+      kernel_size: 3
+      dropout: 0.1
+      norm: group
+      pooling: mean
+    pitcher:
+      num_layers: 2
+      hidden_dim: 48
+      dropout: 0.1
+      keep_sp_separate: true
+      pooling: ip_weighted
+  head:
+    hidden_dims: [128, 64]
+    dropout: 0.1
+    log_lambda_min: -5.0
+    log_lambda_max: 4.0

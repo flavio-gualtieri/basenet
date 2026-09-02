@@ -1,0 +1,28 @@
+# Raw/derived data: large, regenerable from the pipeline, never committed.
+# (Ingested statcast + everything downstream is already ~500MB+ for one
+# season's worth of seasons and only grows -- see DATA.md / the pipeline
+# spec for how to regenerate it: ingest -> pa -> features -> matchups.)
+data/
+
+# Training runs: checkpoints + figures, regenerable via `python -m basenet.train`.
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/*
+!.vscode/settings.json

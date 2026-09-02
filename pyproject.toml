@@ -1,0 +1,37 @@
+[project]
+name = "basenet"
+version = "0.1.0"
+description = "MLB run-prediction: data pipeline + model"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1,<2",
+    "pandas>=2.2,<3",
+    "pyarrow>=17,<26",
+    "numpy>=1.26,<3",
+    "torch>=2.2",
+    "pyyaml>=6.0,<7",
+    "matplotlib>=3.8,<4",
+    # pybaseball on PyPI (2.2.7, 2023-09-08) predates a maintenance gap and
+    # subsequent fixes. jldbc/pybaseball resumed activity (pushed_at
+    # 2026-01-04); pin the exact commit so ingestion is reproducible instead
+    # of floating on an unmaintained fork or a stale release.
+    "pybaseball @ git+https://github.com/jldbc/pybaseball@e588989359059ba04a510cc12aefa972f0a715d6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/basenet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
