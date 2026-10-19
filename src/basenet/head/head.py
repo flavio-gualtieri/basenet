@@ -18,10 +18,13 @@ class HeadConfig:
     dropout: float = 0.1
     log_lambda_min: float = -5.0
     log_lambda_max: float = 4.0
+    park_embedding_dim: int = 4  # learned park vector concatenated onto the head input
 
     def __post_init__(self) -> None:
         if not self.hidden_dims:
             raise ValueError("hidden_dims must contain at least one layer")
+        if self.park_embedding_dim < 0:
+            raise ValueError(f"park_embedding_dim must be >= 0, got {self.park_embedding_dim}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         if self.log_lambda_min >= self.log_lambda_max:
@@ -40,7 +43,7 @@ class ScoreHead(nn.Module):
     ------
     hitter_vec  : (B, H_h)
     pitcher_vec : (B, H_p)
-    context     : (B, F_c)
+    context     : (B, F_c)   (BaseNet passes context + park embedding here)
     returns     : (B,)   log-lambda
     """
 

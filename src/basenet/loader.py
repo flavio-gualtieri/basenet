@@ -17,6 +17,7 @@ being shaken out.
     split.train.pitcher_mask      # (N_train, K), bool
     split.train.pitcher_weights   # (N_train, K), RAW expected innings
     split.train.context           # (N_train, F_c), scaled
+    split.train.park              # (N_train,), int64 park index (0 = unseen in train)
     split.train.y                 # (N_train,)
     split.train.game_pk           # (N_train,) -- kept on CPU, bookkeeping only
 """
@@ -31,7 +32,7 @@ from .data import datasets
 
 _FIELD_NAMES = (
     "lineup", "pa_weights", "pitchers", "pitcher_mask", "pitcher_weights",
-    "context", "y", "game_pk",
+    "context", "park", "y", "game_pk",
 )
 
 
@@ -53,6 +54,7 @@ class SplitTensors:
     pitcher_mask: torch.Tensor
     pitcher_weights: torch.Tensor
     context: torch.Tensor
+    park: torch.Tensor     # int64 park index, never scaled
     y: torch.Tensor
     game_pk: torch.Tensor  # int64, kept on CPU -- bookkeeping, never fed to the model
 
@@ -75,6 +77,7 @@ class SplitTensors:
             pitcher_mask=self.pitcher_mask[idx_dev],
             pitcher_weights=self.pitcher_weights[idx_dev],
             context=self.context[idx_dev],
+            park=self.park[idx_dev],
             y=self.y[idx_dev],
             game_pk=self.game_pk[idx_cpu],
         )
@@ -94,6 +97,8 @@ def _to_split_tensors(arrs: dict[str, np.ndarray], device: torch.device) -> Spli
         arr = arrs[name]
         if name == "game_pk":
             kwargs[name] = torch.as_tensor(arr)  # CPU, native dtype
+        elif name == "park":
+            kwargs[name] = torch.as_tensor(arr, dtype=torch.long, device=device)
         elif name == "pitcher_mask":
             kwargs[name] = torch.as_tensor(arr, dtype=torch.bool, device=device)
         else:

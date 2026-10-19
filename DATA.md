@@ -19,12 +19,13 @@ CLI are in the root spec / each module's `--help`.
   this row's `(game_date, game_pk)` in the ordering key above" — for a
   doubleheader's second game, that includes the first game, which is
   correct (it already happened).
-- **park_id is a team-code proxy, not a real venue id.** Standard statcast
-  pulls carry no venue/ballpark id column. `park_id` = the home team's code.
-  This misattributes park effects whenever a team's home games are actually
-  played elsewhere (the Rays' 2025 season at Steinbrenner Field; London/
-  Mexico City/Seoul/Tokyo series). Known v1 limitation — a v2 would join
-  MLB StatsAPI's schedule for a real venue id per `game_pk`.
+- **`park_id` is the home team's code; `venue_id` is the real ballpark.**
+  Statcast carries no venue column, so `park_id` (used to tell the home side
+  from the away side) is a team code. The actual ballpark is `venue_id`,
+  MLB StatsAPI's venue id per `game_pk` from the schedule snapshot — e.g. it
+  separates the Rays' and A's 2025 temporary homes (Steinbrenner Field,
+  Sutter Health Park) and the London/Mexico City/Seoul/Tokyo series from
+  their usual parks. The model's park embedding is keyed on `venue_id`.
 - **v1 uses actual lineups/starters**, not lineups as known a few hours
   pre-game. Fine for training; not representative of true pre-game
   inference availability.
@@ -39,6 +40,7 @@ One row per plate appearance (the terminal pitch of each `at_bat_number`).
 |---|---|---|
 | `game_pk`, `game_date`, `season` | game identity | n/a (known pre-game) |
 | `park_id` | home team code (see caveat above) | n/a |
+| `venue_id` | StatsAPI venue id — the ballpark actually played in | n/a (known pre-game) |
 | `is_doubleheader_game_2` | True iff this is the later of two same-date game_pks for this team pair (game_pk-ordinal approximation) | n/a |
 | `inning`, `half` | inning number, `Top`/`Bot` | this PA |
 | `batting_team`, `pitching_team` | derived from `half` + park_id | this PA |
@@ -50,11 +52,15 @@ One row per plate appearance (the terminal pitch of each `at_bat_number`).
 | `runs_on_play` | `post_bat_score - bat_score` | this PA |
 | `bb_type` | ground_ball/fly_ball/line_drive/popup, only for balls in play | this PA |
 | `at_bat_number` | internal ordering aid, not a model feature | n/a |
-| `final_home_score`, `final_away_score` | box score, carried on every row of the game for the runs-reconciliation check | end of game (**label-adjacent — never used as a pre-game feature**, only for validation) |
+| `final_home_score`, `final_away_score` | **official** final score from MLB StatsAPI (`data/raw/schedule/`), carried on every row of the game. Statcast's own final is cross-checked against it and `pa` fails on any disagreement except a walk-off with no pitch thrown (e.g. a balk), which statcast cannot see | end of game (**label — never used as a pre-game feature**) |
 
-**Label leakage note:** `final_home_score`/`final_away_score` exist purely
-so `pa.reconcile_runs` (and `validate.py`) can check "do the summed
-`runs_on_play` equal the box score" without a second pass over raw pitches.
+**Label leakage note:** `final_home_score`/`final_away_score` are the
+label source (official scores, see above) and also let `pa.reconcile_runs`
+check "do the summed `runs_on_play` equal the final score". The only
+tolerated gap is a home walk-off whose winning run scored on no plate
+appearance (wild pitch, passed ball, balk): exactly one run, from a tie.
+`validate.py` re-checks every `matchups.runs_scored` label against the
+StatsAPI schedule.
 They are outcome columns for the *current* game and must never be joined
 into a feature for the model — matchups.py only ever reads them to compute
 the label (`runs_scored`), never a feature.
@@ -78,7 +84,7 @@ first PA of each player-game).
 | `std_pa` / `std_bf` | count of PAs (hitter) / batters faced (pitcher) | season-to-date, strictly before this game |
 | `trailing_pa` / `trailing_bf` | same count | trailing 300 PA/BF, strictly before this game, spans season boundaries |
 | `std_{stat}`, `trailing_{stat}` for `stat` in: hitters — `k_pct, bb_pct, hbp_pct, x1b_rate, x2b_rate, x3b_rate, hr_rate, babip, gb_pct, fb_pct`; pitchers — `k_pct, bb_pct, hr_per_bf, gb_pct, contact_pct, whiff_pct` | empirical-Bayes-shrunk rate: `(observed_count + k*league_rate) / (n + k)`, `k` from `config.HITTER_SHRINKAGE_K` / `PITCHER_SHRINKAGE_K` | same STD / trailing window as the count above; `league_rate` is the running league mean for that stat/role/season through the **end of the prior calendar date** (see "league mean" note below) |
-| `is_cold_start` | `std_pa == 0` (hitter) / `std_bf == 0` (pitcher) — literal debut in the ingested window | n/a (flag, not a rate) |
+| `is_cold_start` | `trailing_pa == 0` (hitter) / `trailing_bf == 0` (pitcher) — literal debut in the ingested window (every 2021 player's first game, since the window starts there; ~1% of starters from 2022 on). A season opener for a returning player is *not* a cold start — it shows up as `std_pa`/`std_bf == 0` | n/a (flag, not a rate) |
 | `days_since_last_game` (hitter) / `days_rest` (pitcher) | calendar days since the player's previous game/outing; default (`config.DEFAULT_DAYS_SINCE_LAST_GAME` / `DEFAULT_DAYS_REST`) on a debut | up to and including the prior appearance |
 | `pitch_count_last_outing` (pitcher) | total pitches thrown in the immediately preceding outing | prior outing only |
 | `pitch_count_trailing_3d` (pitcher) | total pitches thrown in the trailing 3 calendar days | strictly before this game |
@@ -99,6 +105,17 @@ them directly off the target game's own `pa` rows instead of rolling them.
 
 ---
 
+## `pitcher_post_game` (`data/interim/pitcher_post_game/*.parquet`)
+
+Keyed on (`player_id`, `game_date`, `game_pk`), one row per pitcher-game,
+with `features.PITCHER_STATE_COLUMNS` (the `player_daily` pitcher columns
+minus the three fatigue features). Same windows as `player_daily`, but read
+**after** the game (inclusive of it) rather than before. Only used to
+resolve bullpen candidates (see the `matchups` notes); never joined onto the
+game it describes.
+
+---
+
 ## `matchups` (`data/processed/matchups/*.parquet`)
 
 Two rows per `game_pk` (see the architecture note in the pipeline spec on
@@ -108,7 +125,7 @@ why this isn't the duplicated-row/complementary-label mistake it resembles)
 
 | column | meaning | window |
 |---|---|---|
-| `game_pk`, `game_date`, `season`, `park_id` | game identity | n/a |
+| `game_pk`, `game_date`, `season`, `park_id`, `venue_id` | game identity (see conventions on `park_id` vs `venue_id`) | n/a |
 | `batting_team`, `pitching_team`, `batting_is_home` | which side of this row is batting | n/a |
 | `is_doubleheader_game_2` | see `pa` table | n/a |
 | `runs_scored` | **label** — this row's batting team's final score | end of game |
@@ -129,12 +146,23 @@ weights, so `resolve_bullpen_set` now resolves each candidate individually.
 `datasets.py` stacks `sp_*` (always index 0) with `bullpen{1..K}_*` into the
 `(N, K, F_p)` tensor the encoder actually reads.
 
+**Bullpen features describe the reliever going into the target game.**
+A reliever usually didn't pitch in the target game, so there's no
+`player_daily` row for him there. His state (counts, shrunk rates,
+`is_cold_start`) comes from `pitcher_post_game` — his state *after* his
+latest appearance strictly before the target game, which is his state going
+into it. His fatigue features (`days_rest`, `pitch_count_last_outing`,
+`pitch_count_trailing_3d`) are recomputed against the target game's date,
+with the same definitions used for starters.
+
 **Bullpen availability (v1 heuristic, still a documented limitation):** a
 pitcher counts as "on the bullpen" if he pitched for this team at least once
 in the trailing `config.BULLPEN_ROSTER_LOOKBACK_DAYS` days (a recent-
 activity proxy for roster membership — misses an IL activation with no
 recent appearances, and would double-count a recently-traded player who
-pitched for both clubs within the window); he's then "available" if his
+pitched for both clubs within the window), and fewer than
+`config.BULLPEN_STARTER_SHARE_EXCLUDE` of those appearances were starts
+(drops the rotation; keeps openers and swingmen); he's then "available" if his
 pitch counts over the trailing 1/2 days are under
 `config.BULLPEN_MAX_PITCHES_1D`/`_2D`. Candidates beyond `MAX_BULLPEN_SIZE`
 are truncated, keeping the most recently used (a deterministic tiebreak,
@@ -154,7 +182,8 @@ every `bullpen{k}_mask` is `False` and features are `0.0` placeholders.
 | `pitchers` | `(N, K, F_p)`, `K = 1 + config.MAX_BULLPEN_SIZE` | index 0 = starter (`sp_*` + handedness); 1..K-1 = bullpen slots (`bullpen{k}_*` + handedness) |
 | `pitcher_mask` | `(N, K)` bool | `True` at every real pitcher, `False` at padding. Index 0 is always `True` (asserted in `build_pitcher_set`) |
 | `pitcher_weights` | `(N, K)` | expected innings per slot, RAW (never scaled): `config.SP_EXPECTED_IP` at index 0, each slot's `ip_share` elsewhere (`0.0` at padding) |
-| `context` | `(N, F_c)` | `batting_is_home`, `park_code` (categorical index via `build_park_vocab`), `month`, `sp_is_cold_start`, `lineup_cold_start_frac` (mean over 9 slots), `bullpen_cold_start_frac` (mean over only the *real*, unpadded bullpen slots; `1.0` if none are real) |
+| `context` | `(N, F_c)` | `batting_is_home`, `month`, `sp_is_cold_start`, `lineup_cold_start_frac` (mean over 9 slots), `bullpen_cold_start_frac` (mean over only the *real*, unpadded bullpen slots; `1.0` if none are real) |
+| `park` | `(N,)` int64 | index of `venue_id` in the train-fit vocab (`build_park_vocab`), for BaseNet's park embedding. `0` = unknown: a venue unseen in train, or with fewer than `datasets.PARK_MIN_TRAIN_ROWS` train rows (one-off venues). Never scaled — it's categorical |
 | `y` | `(N,)` | `runs_scored` |
 | `game_pk` | `(N,)` | carried through for group-aware splitting, never fed to the model |
 
@@ -169,8 +198,9 @@ persisted (`fit_and_persist_split`) alongside the split's `game_pk` lists,
 so val/test are always scored against train-only statistics. `pitchers` is
 fit **mask-aware**: only real (unmasked) rows contribute to the mean/std,
 so padding's fixed `0.0` placeholder never pulls every stat toward zero.
-`pa_weights`, `pitcher_mask`, `pitcher_weights`, `y`, and `game_pk` are never
-scaled — see `datasets.SCALED_KEYS`.
+`pa_weights`, `pitcher_mask`, `pitcher_weights`, `park`, `y`, and `game_pk`
+are never scaled — see `datasets.SCALED_KEYS`. The park vocab is fit on the
+train split only too, persisted with the scaler.
 
 **Loading for training:** `basenet.loader.load_split` wraps
 `fit_and_persist_split` + `build_tensors` + `Scaler.transform` and returns

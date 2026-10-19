@@ -2,10 +2,10 @@
 # (Ingested statcast + everything downstream is already ~500MB+ for one
 # season's worth of seasons and only grows -- see DATA.md / the pipeline
 # spec for how to regenerate it: ingest -> pa -> features -> matchups.)
-data/
+/data/
 
 # Training runs: checkpoints + figures, regenerable via `python -m basenet.train`.
-runs/
+/runs/
 
 # Python
 __pycache__/

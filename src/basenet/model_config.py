@@ -38,6 +38,7 @@ class ModelConfig:
     pitcher: PitcherEncoderConfig
     head: HeadConfig
     context_dim: int  # F_CONTEXT -- carried alongside so BaseNet needs no import from basenet.data
+    n_parks: int      # size of the train-fit park vocab (excluding the UNKNOWN_PARK index 0)
 
 
 def _validate_and_build(cfg_cls: type, section_name: str, raw: dict[str, Any],
@@ -69,7 +70,9 @@ def _validate_and_build(cfg_cls: type, section_name: str, raw: dict[str, Any],
     return cfg_cls(**raw, **injected)
 
 
-def load_model_config(path: Path | str = DEFAULT_CONFIG_PATH) -> ModelConfig:
+def load_model_config(n_parks: int, path: Path | str = DEFAULT_CONFIG_PATH) -> ModelConfig:
+    """`n_parks` is the train split's park vocab size (`len(scaler.park_vocab)`):
+    data-derived per split, so it can't be a yaml value either."""
     path = Path(path)
     with path.open() as f:
         raw = yaml.safe_load(f)
@@ -90,4 +93,5 @@ def load_model_config(path: Path | str = DEFAULT_CONFIG_PATH) -> ModelConfig:
     )
     head = _validate_and_build(HeadConfig, "head", head_raw, {})
 
-    return ModelConfig(hitter=hitter, pitcher=pitcher, head=head, context_dim=datasets.F_CONTEXT)
+    return ModelConfig(hitter=hitter, pitcher=pitcher, head=head, context_dim=datasets.F_CONTEXT,
+                       n_parks=n_parks)
