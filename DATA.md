@@ -6,7 +6,7 @@ over** — that's the part that determines whether the table is safe to train
 on. See each module's docstring for the mechanics; this file is the contract.
 
 Pipeline: `ingest -> pa -> features -> matchups -> datasets`. Run order and
-CLI are in the root spec / each module's `--help`.
+CLI: `make data` (see README.md) / each module's `--help`.
 
 ## Conventions used throughout
 
@@ -72,7 +72,7 @@ the label (`runs_scored`), never a feature.
 ## `player_daily` (`data/interim/player_daily/*.parquet`)
 
 Keyed on **(`player_id`, `role`, `game_date`, `game_pk`)** — `role` is added
-beyond the spec's literal 3-part key because two-way players (a pitcher who
+beyond the natural 3-part key because two-way players (a pitcher who
 also hits, in this window) need independent hitter/pitcher rows rather than
 colliding.
 
@@ -122,7 +122,7 @@ game it describes.
 
 ## `matchups` (`data/processed/matchups/*.parquet`)
 
-Two rows per `game_pk` (see the architecture note in the pipeline spec on
+Two rows per `game_pk` (see the "Row identity" note in `matchups.py`'s docstring on
 why this isn't the duplicated-row/complementary-label mistake it resembles)
 — **both rows must always be routed to the same split; see
 `datasets.chronological_split`.**
@@ -173,7 +173,7 @@ pitched for both clubs within the window), and fewer than
 (drops the rotation; keeps openers and swingmen); he's then "available" if his
 pitch counts over the trailing 1/2 days are under
 `config.BULLPEN_MAX_PITCHES_1D`/`_2D`. Candidates beyond `MAX_BULLPEN_SIZE`
-are truncated, keeping the most recently used (a deterministic tiebreak,
+are truncated, keeping the most recently used, ties broken by pitcher id (a deterministic tiebreak,
 not a claim of significance — see `bullpen_candidates`'s truncation-rate log
 line). If literally no reliever qualifies (observed only on a season's very
 first game, before any relief appearance exists in the ingested window),

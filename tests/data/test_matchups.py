@@ -127,6 +127,34 @@ def test_bullpen_excludes_rotation_starters_keeps_swingman():
     assert set(out.iloc[0]["bullpen_ids"]) == {ids["R"], ids["S"]}
 
 
+def test_bullpen_order_and_truncation_ignore_input_row_order():
+    """Standalone: 16 relievers all last pitched on 05-01, one more (late)
+    on 05-03 -- more than MAX_BULLPEN_SIZE, mostly tied on recency. Most
+    recent first, ties by id, so the kept set and its order must be the same
+    however the input rows happen to be ordered (DuckDB doesn't promise a
+    row order). MLBAM-sized ids, whose set iteration order isn't numeric."""
+    tied = [650000 + 97 * k for k in range(16)]
+    late = 700001
+    games = [(1, dt.date(2099, 5, 1), [1] + tied[::-1]),
+             (2, dt.date(2099, 5, 3), [1, late]),
+             (3, dt.date(2099, 5, 9), [2])]
+    pa_rows, pc_rows = [], []
+    for game_pk, date, pitcher_ids in games:
+        for ab, pid in enumerate(pitcher_ids, start=1):
+            pa_rows.append({"game_pk": game_pk, "pitching_team": "T", "pitcher_id": pid,
+                            "pitcher_throws": "R", "game_date": pd.Timestamp(date), "at_bat_number": ab})
+            pc_rows.append({"pitcher_id": pid, "game_pk": game_pk, "game_date": pd.Timestamp(date),
+                            "n_pitches": 10, "pitching_team": "T"})
+    pa_df, pc_df = pd.DataFrame(pa_rows), pd.DataFrame(pc_rows)
+    target = pd.DataFrame({"game_pk": [3], "pitching_team": ["T"], "game_date": [pd.Timestamp(2099, 5, 9)]})
+    expected = [late] + sorted(tied)[: config.MAX_BULLPEN_SIZE - 1]
+    for seed in range(5):
+        shuffled = pc_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        out = matchups.bullpen_candidates(pa_df, shuffled, target)
+        assert list(out.iloc[0]["bullpen_ids"]) == expected
+        assert out.iloc[0]["n_candidates"] == 17
+
+
 def test_venue_id_comes_from_schedule(pipeline_env):
     """venue_id is StatsAPI's real venue (synthetic: home team id + 100),
     carried on both rows of every game; park_id stays the home-team code."""

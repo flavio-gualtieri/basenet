@@ -6,10 +6,11 @@ pipeline output for the given seasons. Exits non-zero on any failure.
 This is deliberately the same logic as `tests/data/test_leakage.py`'s named
 checks (test_runs_reconcile, test_two_rows_per_game), run here against the
 real `data/` tree instead of the synthetic pytest fixture, plus a check of
-every training label against StatsAPI's official final scores, plus the full
-pytest suite (which additionally covers the split-mechanism checks --
-test_game_grouping, test_chronological, test_scaler_fit_scope -- that don't
-depend on which seasons are real vs synthetic).
+every training label against StatsAPI's official final scores, plus the
+data-layer pytest suite in tests/data/ (which additionally covers the
+split-mechanism checks -- test_game_grouping, test_chronological,
+test_scaler_fit_scope -- that don't depend on which seasons are real vs
+synthetic).
 """
 from __future__ import annotations
 

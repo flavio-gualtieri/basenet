@@ -1,8 +1,7 @@
 """Filesystem layout + a tiny stage-timing helper shared by every CLI stage.
 
 Every stage in this package prints rows-in / rows-out / wall-time (see
-``StageTimer`` below) so a run can be sanity-checked from stdout alone, per
-the pipeline spec's CLI contract.
+``StageTimer`` below) so a run can be sanity-checked from stdout alone.
 
 All path constants below are computed live from `$BASENET_DATA_ROOT` on every
 access (via module `__getattr__`, PEP 562) rather than frozen once at import

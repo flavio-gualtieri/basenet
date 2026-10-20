@@ -11,7 +11,7 @@ from typing import Final
 # Seasons
 # ---------------------------------------------------------------------------
 
-# 2020 is excluded per spec: 60-game season, expanded playoffs, universal DH
+# 2020 is excluded: 60-game season, expanded playoffs, universal DH
 # introduced mid-stream, no-fans park effects — not representative.
 SEASONS: Final[list[int]] = [2021, 2022, 2023, 2024, 2025]
 
@@ -63,7 +63,7 @@ HITTER_SHRINKAGE_K: Final[dict[str, float]] = {
     "x2b_rate": 500.0,
     "x3b_rate": 1000.0,  # very rare
     "hr_rate": 150.0,
-    "babip": 800.0,      # notoriously slow to stabilize (spec calls this out explicitly)
+    "babip": 800.0,      # notoriously slow to stabilize
     "gb_pct": 80.0,
     "fb_pct": 80.0,
     # quality of contact ("contact" feature group): per PA (xwOBA) or per
@@ -183,7 +183,7 @@ EVENTS_TO_OUTCOME: Final[dict[str, str]] = {
     # A fielder's choice means the batter reached base but is not the out;
     # it doesn't cleanly fit OUT_IP (batter safe) or any hit code. It's a
     # small fraction of PAs (~1%); we bucket it (and catcher's interference)
-    # as OTHER rather than inventing a category the spec's enum doesn't have.
+    # as OTHER rather than inventing a new outcome category.
     "fielders_choice": "OTHER",
     "fielders_choice_out": "OTHER",
     "catcher_interf": "OTHER",
@@ -249,7 +249,7 @@ BULLPEN_ROSTER_LOOKBACK_DAYS: Final[int] = 30
 BULLPEN_STARTER_SHARE_EXCLUDE: Final[float] = 0.5
 
 # v1 expected-innings heuristic: split this many total innings uniformly
-# across available relievers. Left as a heuristic per spec; the interface
+# across available relievers. Deliberately left as a heuristic; the interface
 # (`matchups.estimate_bullpen_ip_shares`) is written so a learned policy can
 # be swapped in without changing callers.
 BULLPEN_EXPECTED_TOTAL_IP: Final[float] = 3.5

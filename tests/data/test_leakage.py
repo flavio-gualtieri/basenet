@@ -1,5 +1,6 @@
-"""The six non-negotiable leakage tests from the pipeline spec (section 6).
-Each test name below matches the spec's naming exactly.
+"""The six non-negotiable leakage tests: the invariants that make the
+matchups table safe to train on. validate.py re-runs the real-data analogues
+(runs reconcile, two rows per game) against the actual data/ tree.
 """
 from __future__ import annotations
 

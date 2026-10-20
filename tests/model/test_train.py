@@ -1,7 +1,7 @@
 """End-to-end smoke test of training on the synthetic pipeline output: the
 model side (loader -> BaseNet -> GLM baseline -> early stopping -> checkpoint)
-wires together and produces finite metrics. Lives under tests/data/ only to
-reuse its `pipeline_env` fixture."""
+wires together and produces finite metrics. `pipeline_env` comes from
+tests/conftest.py."""
 from __future__ import annotations
 
 import json

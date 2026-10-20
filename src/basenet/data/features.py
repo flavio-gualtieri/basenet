@@ -19,7 +19,7 @@ Inputs:
 Leakage contract
 -----------------
 `player_daily` is keyed on (player_id, role, game_date, game_pk) [role added
-beyond the spec's literal (player_id, game_date, game_pk) key so two-way
+beyond the natural (player_id, game_date, game_pk) key so two-way
 players -- Ohtani pitches and hits in the same seasons we're ingesting -- get
 independent hitter and pitcher rows instead of colliding]. Every stat stored
 for a row is computed using ONLY PAs/pitches strictly before that row's

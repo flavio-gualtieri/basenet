@@ -1,5 +1,5 @@
-"""Assemble the final training table: two rows per game (see module-level
-note below on why that's not the classic duplicated-row mistake).
+"""Assemble the final training table: two rows per game (see "Row identity"
+below on why that's not the classic duplicated-row mistake).
 
     python -m basenet.data.matchups --seasons 2021 2022 2023 2024 2025
 
@@ -8,19 +8,25 @@ Inputs: `data/interim/pa/season=YYYY/*.parquet` and
 seasons (player_daily must already cover any earlier seasons needed for its
 own trailing windows -- that happened in features.py, not here).
 
-**v1 caveat (repeated from the spec, load-bearing):** lineups and starters
+**v1 caveat (load-bearing):** lineups and starters
 are the *actual* ones that appeared, not lineups as they'd be knowable a few
 hours pre-game. This table is for training; it is not what a real
 production pre-game inference pipeline would have available at prediction
 time.
 
 Row identity: `batting_is_home` distinguishes the two rows a `game_pk`
-produces (batting_team == park_id iff home). Both rows are still
-statistically coupled (park, weather, umpire, day) -- see
-`GROUP_KEY` and `datasets.chronological_split`: splits must group on
-`game_pk`, never split its two rows apart.
+produces (batting_team == park_id iff home). The mistake this resembles is
+duplicating a game as (A vs B, y) and (B vs A, 1 - y) for a win/loss label,
+where one row's label is a function of the other's: the second row adds no
+information, and a split that separates the pair hands the model the
+answer. Here the two rows are different predictions -- the home lineup
+against the away pitching staff (label: home runs), and the reverse (label:
+away runs) -- with different inputs and labels that don't determine each
+other. Both rows are still statistically coupled (park, weather, umpire,
+day) -- see `GROUP_KEY` and `datasets.chronological_split`: splits must
+group on `game_pk`, never split its two rows apart.
 
-Two design points worth calling out explicitly (both settled after review):
+Two design points worth calling out explicitly:
 
 - **Expected PA per lineup slot is measured, not configured.** It's an
   empirical, leakage-safe quantity computed from our own PA table (see
@@ -274,7 +280,12 @@ def bullpen_candidates(
                 avail.append(pid)
 
         last_seen = team_hist[team_hist["pitcher_id"].isin(avail)].groupby("pitcher_id")["game_date"].max()
-        avail_sorted = sorted(avail, key=lambda pid: last_seen[pid], reverse=True)
+        # Relievers last seen on the same date tie on recency; pre-sorting by
+        # id (the sort is stable, reverse included) breaks those ties the
+        # same way every run. Without it the order fell back to set/DuckDB
+        # row order, which varies between runs and changed who survived
+        # truncation.
+        avail_sorted = sorted(sorted(avail), key=lambda pid: last_seen[pid], reverse=True)
         if len(avail_sorted) > config.MAX_BULLPEN_SIZE:
             n_truncated += 1
         bullpen_ids = avail_sorted[: config.MAX_BULLPEN_SIZE]
