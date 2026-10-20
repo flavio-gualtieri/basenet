@@ -27,7 +27,7 @@ def test_tensor_shapes(pipeline_env):
 def test_expected_pa_channel_breaks_slot_symmetry(pipeline_env):
     df = datasets.load_matchups([2021])
     tensors = datasets.build_tensors(df)
-    expected_pa_idx = len(datasets.HITTER_FEATURE_COLUMNS)  # channel order: features..., expected_pa, hand
+    expected_pa_idx = len(datasets.hitter_columns())  # channel order: features..., expected_pa, hand
     slot1_expected_pa = tensors["lineup"][:, 0, expected_pa_idx]
     slot9_expected_pa = tensors["lineup"][:, 8, expected_pa_idx]
     assert np.allclose(slot1_expected_pa, config.DEFAULT_PA_PER_SLOT[1])

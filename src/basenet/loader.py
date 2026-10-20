@@ -108,14 +108,15 @@ def _to_split_tensors(arrs: dict[str, np.ndarray], device: torch.device) -> Spli
 
 def load_split(
     seasons_train: list[int], season_val: int, season_test: int,
-    device: str | torch.device | None = None,
+    device: str | torch.device | None = None, feature_groups=(),
 ) -> Split:
     """Fits the chronological split + scaler on `seasons_train` (persisting
     both, same as calling `datasets.fit_and_persist_split` directly), then
     builds, scales, and device-places tensors for all three splits.
     """
     dev = _pick_device(device)
-    scaler = datasets.fit_and_persist_split(seasons_train, season_val, season_test)
+    scaler = datasets.fit_and_persist_split(seasons_train, season_val, season_test,
+                                            feature_groups=feature_groups)
     train_pks, val_pks, test_pks = datasets.chronological_split(seasons_train, season_val, season_test)
 
     all_df = datasets.load_matchups(seasons_train + [season_val, season_test])
@@ -123,7 +124,7 @@ def load_split(
     parts: dict[str, SplitTensors] = {}
     for name, pks in (("train", train_pks), ("val", val_pks), ("test", test_pks)):
         df = all_df[all_df["game_pk"].isin(pks)]
-        tensors = datasets.build_tensors(df, scaler.park_vocab)
+        tensors = datasets.build_tensors(df, scaler.park_vocab, feature_groups)
         tensors = scaler.transform(tensors)
         parts[name] = _to_split_tensors(tensors, dev)
 

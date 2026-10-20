@@ -66,6 +66,12 @@ HITTER_SHRINKAGE_K: Final[dict[str, float]] = {
     "babip": 800.0,      # notoriously slow to stabilize (spec calls this out explicitly)
     "gb_pct": 80.0,
     "fb_pct": 80.0,
+    # quality of contact ("contact" feature group): per PA (xwOBA) or per
+    # batted ball with a measured exit velocity (hard-hit, barrel). Contact
+    # quality stabilizes far faster than hit outcomes -- the point of these.
+    "xwoba": 200.0,
+    "hard_hit_pct": 60.0,
+    "barrel_pct": 100.0,
 }
 
 PITCHER_SHRINKAGE_K: Final[dict[str, float]] = {
@@ -75,6 +81,10 @@ PITCHER_SHRINKAGE_K: Final[dict[str, float]] = {
     "gb_pct": 70.0,
     "contact_pct": 100.0,
     "whiff_pct": 100.0,
+    # quality of contact ALLOWED -- noisier for pitchers than hitters
+    "xwoba": 300.0,
+    "hard_hit_pct": 150.0,
+    "barrel_pct": 200.0,
 }
 
 # Bootstrap-only league-average priors, rough modern-era (2021-2025) anchors.
@@ -91,11 +101,53 @@ LEAGUE_MEAN_FALLBACK_HITTER: Final[dict[str, float]] = {
     "k_pct": 0.23, "bb_pct": 0.085, "hbp_pct": 0.01,
     "x1b_rate": 0.145, "x2b_rate": 0.045, "x3b_rate": 0.004, "hr_rate": 0.032,
     "babip": 0.29, "gb_pct": 0.44, "fb_pct": 0.35,
+    "xwoba": 0.315, "hard_hit_pct": 0.39, "barrel_pct": 0.075,
 }
 LEAGUE_MEAN_FALLBACK_PITCHER: Final[dict[str, float]] = {
     "k_pct": 0.23, "bb_pct": 0.085, "hr_per_bf": 0.032,
     "gb_pct": 0.44, "contact_pct": 0.77, "whiff_pct": 0.24,
+    "xwoba": 0.315, "hard_hit_pct": 0.39, "barrel_pct": 0.075,
 }
+
+# Batted balls at or above this exit velocity (mph) count as hard-hit
+# (Statcast's own definition); a barrel is statcast's launch_speed_angle == 6.
+HARD_HIT_MPH: Final[float] = 95.0
+BARREL_LAUNCH_SPEED_ANGLE: Final[int] = 6
+
+# Platoon splits ("platoon" feature group): a hitter's rates vs LHP / RHP
+# and a pitcher's vs LHB / RHB, over every earlier PA in the ingested window,
+# shrunk toward the player's OWN overall rate (itself shrunk toward the
+# league) with this many PA/BF. Platoon splits are notoriously noisy -- most
+# of an observed split is sample noise -- hence a large k.
+PLATOON_SHRINKAGE_K: Final[float] = 250.0
+
+# Starter workload ("workload" feature group): batters faced per start over
+# a pitcher's last STARTER_BF_LOOKBACK_STARTS starts (any season), shrunk
+# toward STARTER_BF_PRIOR with STARTER_BF_PRIOR_K starts of weight -- a light
+# bootstrap prior for a pitcher with few or no starts in the window, not a
+# calibrated target (measured 2021-25 mean: 21.3-22.0 BF/start, sd ~4.7).
+STARTER_BF_LOOKBACK_STARTS: Final[int] = 5
+STARTER_BF_PRIOR: Final[float] = 21.9
+STARTER_BF_PRIOR_K: Final[float] = 2.0
+# Converts expected batters faced to expected innings (measured: 4.24 PA per
+# half-inning, 2021-25). Used for the pitcher-set pooling weights.
+BATTERS_PER_INNING: Final[float] = 4.24
+# Defensive innings a team pitches in a game, split between starter and bullpen.
+TEAM_INNINGS_PER_GAME: Final[float] = 9.0
+
+# Schedule context ("schedule" group): days since a team's previous game,
+# capped here (and set here for a season opener) -- beyond a few days, more
+# rest is just "rested".
+TEAM_REST_DAYS_CAP: Final[int] = 4
+
+# Weather ("weather" group), from StatsAPI's game-time report.
+WEATHER_INDOOR_CONDITIONS: Final[set[str]] = {"Dome", "Roof Closed"}
+WEATHER_PRECIP_CONDITIONS: Final[set[str]] = {"Drizzle", "Rain", "Snow"}
+# A reported temperature below this is a placeholder, not weather (two
+# 2024 indoor games report 0F; the coldest real reports are ~32F) -- it's
+# treated as missing and gets DEFAULT_TEMP_F, a typical climate-controlled value.
+MIN_PLAUSIBLE_TEMP_F: Final[float] = 20.0
+DEFAULT_TEMP_F: Final[float] = 72.0
 
 # ---------------------------------------------------------------------------
 # Plate-appearance outcome vocabulary + statcast `events` -> outcome mapping.

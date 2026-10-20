@@ -28,7 +28,7 @@ from .ids import build_id_crosswalk, upsert_crosswalk
 from .paths import ensure_dir, raw_schedule_season_dir, raw_statcast_season_dir, StageTimer
 
 STATSAPI_SCHEDULE_URL = (
-    "https://statsapi.mlb.com/api/v1/schedule?sportId=1&season={season}&gameType=R"
+    "https://statsapi.mlb.com/api/v1/schedule?sportId=1&season={season}&gameType=R&hydrate=weather"
 )
 
 # One row per schedule entry, NOT per game: a postponed game appears once
@@ -39,6 +39,11 @@ SCHEDULE_COLUMNS = [
     "detailed_state", "home_team_id", "home_team_name", "away_team_id",
     "away_team_name", "home_score", "away_score", "venue_id", "venue_name",
     "double_header", "game_number",
+    # pre-game context (see matchups.schedule_context): day/night, scheduled
+    # first pitch (UTC), and the official game-time weather. Weather is as
+    # reported at first pitch -- a slightly optimistic stand-in for the
+    # forecast a pre-game model would see (same caveat as actual lineups).
+    "day_night", "game_datetime_utc", "weather_condition", "weather_temp", "weather_wind",
 ]
 
 
@@ -120,9 +125,16 @@ def parse_schedule(payload: dict, season: int) -> pd.DataFrame:
                 "venue_name": g.get("venue", {}).get("name"),
                 "double_header": g.get("doubleHeader"),
                 "game_number": g.get("gameNumber"),
+                "day_night": g.get("dayNight"),
+                "game_datetime_utc": g.get("gameDate"),
+                "weather_condition": g.get("weather", {}).get("condition"),
+                "weather_temp": g.get("weather", {}).get("temp"),
+                "weather_wind": g.get("weather", {}).get("wind"),
             })
     df = pd.DataFrame(rows, columns=SCHEDULE_COLUMNS)
     df["official_date"] = pd.to_datetime(df["official_date"])
+    df["game_datetime_utc"] = pd.to_datetime(df["game_datetime_utc"], utc=True)
+    df["weather_temp"] = pd.to_numeric(df["weather_temp"], errors="coerce")
     # unplayed games carry no score: nullable ints, not floats
     for c in ("home_score", "away_score", "venue_id"):
         df[c] = df[c].astype("Int64")
@@ -162,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
                          choices=config.SEASONS)
     parser.add_argument("--force", action="store_true",
                          help="re-pull and overwrite even if a snapshot already exists")
+    parser.add_argument("--refresh-schedule", action="store_true",
+                        help="re-pull only the StatsAPI schedule snapshot (cheap; e.g. after adding columns)")
     parser.add_argument("--skip-crosswalk", action="store_true",
                          help="skip the id-crosswalk resolution step (faster iteration)")
     args = parser.parse_args(argv)
@@ -170,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         df = ingest_season(season, force=args.force)
         if df is not None and not args.skip_crosswalk:
             update_id_crosswalk(df)
-        ingest_schedule(season, force=args.force)
+        ingest_schedule(season, force=args.force or args.refresh_schedule)
     return 0
 
 

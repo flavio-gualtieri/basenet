@@ -5,7 +5,8 @@ Each of `model.encoder.hitter`, `model.encoder.pitcher`, and `model.head`
 must supply EXACTLY the fields its dataclass expects -- no more, no less --
 with one deliberate exception: `in_dim` (for both encoders) is never a yaml
 field. It's derived from the data layer's own feature counts
-(`basenet.data.datasets.F_HITTER` / `F_PITCHER`) and injected here, so it
+(`basenet.data.datasets.feature_dims(groups)`, for the yaml `features.groups`)
+and injected here, so it
 can never silently drift out of sync with `features.py`'s actual column
 list. A yaml section missing a required field, carrying a misspelled one,
 or carrying `in_dim` by hand, raises -- it does not fall back to the
@@ -39,6 +40,7 @@ class ModelConfig:
     head: HeadConfig
     context_dim: int  # F_CONTEXT -- carried alongside so BaseNet needs no import from basenet.data
     n_parks: int      # size of the train-fit park vocab (excluding the UNKNOWN_PARK index 0)
+    feature_groups: tuple[str, ...] = ()  # configs.yaml `features.groups` -- see datasets.FEATURE_GROUPS
 
 
 def _validate_and_build(cfg_cls: type, section_name: str, raw: dict[str, Any],
@@ -70,6 +72,19 @@ def _validate_and_build(cfg_cls: type, section_name: str, raw: dict[str, Any],
     return cfg_cls(**raw, **injected)
 
 
+def load_feature_groups(path: Path | str = DEFAULT_CONFIG_PATH) -> tuple[str, ...]:
+    """configs.yaml `features.groups`: which optional feature groups
+    (datasets.FEATURE_GROUPS) reach the tensors. Required, like every other
+    field -- an empty list means the base feature set."""
+    with Path(path).open() as f:
+        raw = yaml.safe_load(f)
+    try:
+        groups = raw["features"]["groups"]
+    except (KeyError, TypeError) as e:
+        raise ValueError(f"{path} is missing `features.groups` (use [] for none)") from e
+    return datasets.validate_groups(groups or ())
+
+
 def load_model_config(n_parks: int, path: Path | str = DEFAULT_CONFIG_PATH) -> ModelConfig:
     """`n_parks` is the train split's park vocab size (`len(scaler.park_vocab)`):
     data-derived per split, so it can't be a yaml value either."""
@@ -85,13 +100,15 @@ def load_model_config(n_parks: int, path: Path | str = DEFAULT_CONFIG_PATH) -> M
     except KeyError as e:
         raise ValueError(f"{path} is missing expected section {e}") from e
 
+    groups = load_feature_groups(path)
+    f_hitter, f_pitcher, f_context = datasets.feature_dims(groups)
     hitter = _validate_and_build(
-        HitterEncoderConfig, "encoder.hitter", hitter_raw, {"in_dim": datasets.F_HITTER},
+        HitterEncoderConfig, "encoder.hitter", hitter_raw, {"in_dim": f_hitter},
     )
     pitcher = _validate_and_build(
-        PitcherEncoderConfig, "encoder.pitcher", pitcher_raw, {"in_dim": datasets.F_PITCHER},
+        PitcherEncoderConfig, "encoder.pitcher", pitcher_raw, {"in_dim": f_pitcher},
     )
     head = _validate_and_build(HeadConfig, "head", head_raw, {})
 
-    return ModelConfig(hitter=hitter, pitcher=pitcher, head=head, context_dim=datasets.F_CONTEXT,
-                       n_parks=n_parks)
+    return ModelConfig(hitter=hitter, pitcher=pitcher, head=head, context_dim=f_context,
+                       n_parks=n_parks, feature_groups=groups)

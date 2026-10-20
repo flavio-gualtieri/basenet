@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "scipy>=1.11",  # tests check basenet.distributions against scipy.stats
 ]
 
 [build-system]

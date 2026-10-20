@@ -64,6 +64,10 @@ PA_COLUMNS = [
     # only when `outcome` is a ball put in play (OUT_IP/1B/2B/3B/HR/ROE) --
     # feeds GB%/FB% in features.py.
     "bb_type",
+    # quality of contact / run value of the PA's terminal pitch -- feed the
+    # xwOBA / hard-hit / barrel features in features.py (outcomes of THIS
+    # PA: only ever used through strictly-earlier windows).
+    "woba_value", "woba_denom", "launch_speed", "launch_speed_angle", "xwoba_contact",
     # internal/auxiliary -- see DATA.md
     "at_bat_number", "final_home_score", "final_away_score",
 ]
@@ -253,7 +257,9 @@ def build_pa_table(season: int) -> pd.DataFrame:
                       ORDER BY at_bat_number)
                 AS runs_on_play,
             {_events_case_sql()} AS outcome,
-            bb_type
+            bb_type,
+            woba_value, woba_denom, launch_speed, launch_speed_angle,
+            estimated_woba_using_speedangle AS xwoba_contact
         FROM terminal
     ),
     slotted AS (
@@ -285,6 +291,7 @@ def build_pa_table(season: int) -> pd.DataFrame:
         s.inning, s.half, s.batting_team, s.pitching_team,
         s.batter_id, s.pitcher_id, s.batter_stands, s.pitcher_throws,
         s.order_slot, s.times_through_order, s.outcome, s.runs_on_play, s.bb_type,
+        s.woba_value, s.woba_denom, s.launch_speed, s.launch_speed_angle, s.xwoba_contact,
         s.at_bat_number, finals.final_home_score, finals.final_away_score,
         s.home_team, s.away_team
     FROM slotted s

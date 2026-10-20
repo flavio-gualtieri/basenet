@@ -8,9 +8,15 @@ Loads `configs.yaml` via `model_config.load_model_config()`, builds
 `BaseNet`, trains with full-in-memory minibatches (see `loader.py` -- no
 `Dataset`/`DataLoader`), evaluates on val every epoch, reports final
 train/val/test metrics against two baselines -- a constant prediction (the
-training mean `runs_scored`; the floor) and a linear Poisson GLM on the same
+training mean `runs_scored`; the floor) and a linear count GLM on the same
 inputs (see baseline.py; the bar BaseNet actually has to clear) -- and saves
 a checkpoint + a training-curve figure.
+
+All losses are FULL negative log-likelihoods (nats per team-game, including
+log y!) under the head's configured distribution (configs.yaml
+`model.head.distribution`), and the baselines use that same distribution.
+`*_geo_p` = exp(-NLL): the geometric-mean probability the model put on the
+run totals that actually happened -- comparable across distributions.
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import argparse
 import copy
 import dataclasses
 import json
+import math
 import time
 from pathlib import Path
 
@@ -26,10 +33,11 @@ matplotlib.use("Agg")  # headless: this writes a file, never opens a window
 import matplotlib.pyplot as plt
 import torch
 
-from .baseline import fit_glm, PoissonGLM
+from .baseline import fit_constant, fit_glm
+from .distributions import nll
 from .loader import load_split, SplitTensors
 from .model import BaseNet
-from .model_config import DEFAULT_CONFIG_PATH, load_model_config
+from .model_config import DEFAULT_CONFIG_PATH, load_feature_groups, load_model_config
 
 DEFAULT_OUT_DIR = Path(__file__).resolve().parents[2] / "runs"
 
@@ -38,25 +46,18 @@ def _mae(pred: torch.Tensor, target: torch.Tensor) -> float:
     return (pred - target).abs().mean().item()
 
 
-def _baseline_metrics(train_y: torch.Tensor, target: SplitTensors) -> dict[str, float]:
-    """Constant-prediction baseline: always predict the training set's mean
-    runs_scored, regardless of matchup. Doesn't touch the model at all --
-    exists purely so the trained model's own numbers have something to beat.
-    """
-    mean_runs = train_y.mean().clamp_min(1e-6)
-    log_lambda = torch.log(mean_runs).expand_as(target.y)
-    criterion = torch.nn.PoissonNLLLoss(log_input=True, full=False, reduction="mean")
-    nll = criterion(log_lambda, target.y).item()
-    mae = _mae(mean_runs.expand_as(target.y), target.y)
-    return {"nll": nll, "mae": mae}
-
-
 @torch.no_grad()
-def _glm_metrics(glm: PoissonGLM, target: SplitTensors) -> dict[str, float]:
-    log_lambda = glm(target)
+def _baseline_metrics(model: torch.nn.Module, target: SplitTensors) -> dict[str, float]:
+    """Full NLL + MAE for a baseline from baseline.py (constant or GLM),
+    under its own distribution/dispersion."""
+    log_mu = model(target)
     y = target.y.cpu()
-    criterion = torch.nn.PoissonNLLLoss(log_input=True, full=False, reduction="mean")
-    return {"nll": criterion(log_lambda, y).item(), "mae": _mae(torch.exp(log_lambda), y)}
+    return {"nll": nll(log_mu, y, model.distribution, model.log_r).item(),
+            "mae": _mae(torch.exp(log_mu), y)}
+
+
+def _dispersion(log_r: torch.Tensor | None) -> float | None:
+    return None if log_r is None else float(torch.exp(log_r.detach()))
 
 
 def train(
@@ -71,7 +72,8 @@ def train(
     scored once, on that model)."""
     torch.manual_seed(seed)
 
-    split = load_split(seasons_train, season_val, season_test, device=device)
+    feature_groups = load_feature_groups(config_path)
+    split = load_split(seasons_train, season_val, season_test, device=device, feature_groups=feature_groups)
     cfg = load_model_config(n_parks=len(split.scaler.park_vocab), path=config_path)
     net = BaseNet(cfg).to(split.train.lineup.device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
@@ -129,11 +131,12 @@ def train(
         test_loss = net.loss(split.test).item()
         test_mae = _mae(net.predict_runs(split.test), split.test.y)
 
-    baseline_val = _baseline_metrics(split.train.y, split.val)
-    baseline_test = _baseline_metrics(split.train.y, split.test)
-    glm = fit_glm(split.train, n_parks=len(split.scaler.park_vocab))
-    glm_val = _glm_metrics(glm, split.val)
-    glm_test = _glm_metrics(glm, split.test)
+    constant = fit_constant(split.train, distribution=net.distribution)
+    baseline_val = _baseline_metrics(constant, split.val)
+    baseline_test = _baseline_metrics(constant, split.test)
+    glm = fit_glm(split.train, n_parks=len(split.scaler.park_vocab), distribution=net.distribution)
+    glm_val = _baseline_metrics(glm, split.val)
+    glm_test = _baseline_metrics(glm, split.test)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +157,7 @@ def train(
     ax1.axhline(glm_val["nll"], color="black", linestyle=":", label="val baseline (GLM)")
     ax1.axvline(best["epoch"], color="tab:green", alpha=0.4, label=f"best epoch ({best['epoch']})")
     ax1.set_xlabel("epoch")
-    ax1.set_ylabel("Poisson NLL")
+    ax1.set_ylabel(f"NLL, nats/team-game ({net.distribution})")
     ax1.set_title("loss")
     ax1.legend()
     ax2.plot(history["epoch"], history["val_mae"], color="tab:orange", label="val MAE")
@@ -173,13 +176,24 @@ def train(
         "epochs": epochs, "epochs_run": history["epoch"][-1], "best_epoch": best["epoch"],
         "batch_size": batch_size, "lr": lr, "weight_decay": weight_decay, "patience": patience,
         "seed": seed, "config": str(config_path),
-        # val/test metrics below are all for the restored best-epoch model
+        # Every *_loss / *_nll below is a FULL NLL under `distribution`, for
+        # the restored best-epoch model and for baselines fit with the same
+        # distribution; *_geo_p = exp(-nll), the geometric-mean probability
+        # of the actual run totals.
+        "distribution": net.distribution,
+        "feature_groups": list(feature_groups),
+        "dispersion_r": _dispersion(net.log_r),
+        "baseline_dispersion_r": _dispersion(constant.log_r),
+        "glm_dispersion_r": _dispersion(glm.log_r),
         "best_val_loss": best["val_loss"], "best_val_mae": best_val_mae,
-        "test_loss": test_loss, "test_mae": test_mae,
+        "best_val_geo_p": math.exp(-best["val_loss"]),
+        "test_loss": test_loss, "test_mae": test_mae, "test_geo_p": math.exp(-test_loss),
         "baseline_val_nll": baseline_val["nll"], "baseline_val_mae": baseline_val["mae"],
+        "baseline_val_geo_p": math.exp(-baseline_val["nll"]),
         "baseline_test_nll": baseline_test["nll"], "baseline_test_mae": baseline_test["mae"],
-        "glm_val_nll": glm_val["nll"], "glm_val_mae": glm_val["mae"],
-        "glm_test_nll": glm_test["nll"], "glm_test_mae": glm_test["mae"],
+        "baseline_test_geo_p": math.exp(-baseline_test["nll"]),
+        "glm_val_nll": glm_val["nll"], "glm_val_mae": glm_val["mae"], "glm_val_geo_p": math.exp(-glm_val["nll"]),
+        "glm_test_nll": glm_test["nll"], "glm_test_mae": glm_test["mae"], "glm_test_geo_p": math.exp(-glm_test["nll"]),
         "checkpoint": str(ckpt_path), "figure": str(fig_path),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))

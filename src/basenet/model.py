@@ -52,8 +52,18 @@ class BaseNet(nn.Module):
         return self.head(hitter_vec, pitcher_vec, context)
 
     def loss(self, batch: SplitTensors) -> torch.Tensor:
-        """Poisson NLL against `batch.y`. Mirrors ScoreHead.loss() one level up."""
+        """Full NLL against `batch.y` under cfg.head.distribution. Mirrors
+        ScoreHead.loss() one level up."""
         return self.head.loss(self(batch), batch.y)
+
+    @property
+    def distribution(self) -> str:
+        return self.cfg.head.distribution
+
+    @property
+    def log_r(self) -> torch.Tensor | None:
+        """Log negbin dispersion (None for Poisson) -- pass to basenet.distributions."""
+        return self.head.log_r
 
     @torch.no_grad()
     def predict_runs(self, batch: SplitTensors) -> torch.Tensor:

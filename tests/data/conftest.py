@@ -50,6 +50,15 @@ BIP_OUTCOMES = {"OUT_IP", "1B", "2B", "3B", "HR", "ROE"}
 # alternate ground_ball/fly_ball so GB%/FB% have both to work with
 _BB_TYPE_CYCLE = itertools.cycle(["ground_ball", "fly_ball"])
 
+# Run value / contact quality per outcome (deterministic, roughly real-world
+# scale): (woba_value, launch_speed, launch_speed_angle, xwOBA on contact).
+# Only balls in play get EV / launch_speed_angle / xwOBA; HR is a barrel (6).
+CONTACT_FOR_OUTCOME = {
+    "K": (0.0, None, None, None), "BB": (0.69, None, None, None), "HBP": (0.72, None, None, None),
+    "OUT_IP": (0.0, 85.0, 3, 0.2), "1B": (0.88, 92.0, 4, 0.5), "2B": (1.25, 100.0, 5, 0.9),
+    "3B": (1.58, 98.0, 5, 0.8), "HR": (2.0, 105.0, 6, 1.6), "ROE": (0.9, 88.0, 3, 0.3),
+}
+
 DESCRIPTION_FOR_OUTCOME = {
     "K": "swinging_strike",
     "BB": "ball",
@@ -110,7 +119,10 @@ def _simulate_game(
                 # this synthetic game, so it's always his first time through.
                 n_thru = 1
 
+                woba_value, launch_speed, launch_speed_angle, xwoba_contact = CONTACT_FOR_OUTCOME[outcome]
                 rows.append(dict(
+                    woba_value=woba_value, woba_denom=1, launch_speed=launch_speed,
+                    launch_speed_angle=launch_speed_angle, estimated_woba_using_speedangle=xwoba_contact,
                     game_pk=game_pk, game_date=game_date, season=season, game_type="R",
                     home_team=home_team, away_team=away_team,
                     inning=inning, inning_topbot=half,
@@ -196,6 +208,8 @@ def _append_non_pa_walkoff(rows: list[dict], game_pk: int) -> None:
         home_score=last["post_home_score"], away_score=last["post_away_score"],
         post_home_score=last["post_home_score"] + 1, post_away_score=last["post_away_score"],
         events=None, bb_type=None, description="ball",
+        woba_value=None, woba_denom=None, launch_speed=None, launch_speed_angle=None,
+        estimated_woba_using_speedangle=None,
     ))
 
 
@@ -219,9 +233,25 @@ def build_synthetic_schedule(raw: pd.DataFrame, season: int) -> pd.DataFrame:
     g["venue_name"] = g["home_team_name"] + " Park"
     g["double_header"] = "N"
     g["game_number"] = 1
+    # odd game_pks are day games (so 1001, the doubleheader nightcap, is a
+    # day game after a night game on the same date -- gap 0, not "after night")
+    g["day_night"] = (g["game_pk"] % 2).map({1: "day", 0: "night"})
+    g["game_datetime_utc"] = pd.to_datetime(g["official_date"]).dt.tz_localize("UTC") + pd.Timedelta(23, unit="h")
+    # AAA's park: wind blowing out; BBB's: blowing in. Game 2001 is played
+    # under a closed roof with the placeholder 0F temperature StatsAPI
+    # sometimes reports indoors.
+    aaa_home = g["home_team_name"] == "AAA"
+    g["weather_condition"] = "Clear"
+    g["weather_temp"] = aaa_home.map({True: 80.0, False: 60.0})
+    g["weather_wind"] = aaa_home.map({True: "10 mph, Out To CF", False: "5 mph, In From LF"})
+    roof = g["game_pk"] == ROOF_CLOSED_GAME_PK
+    g.loc[roof, ["weather_condition", "weather_temp", "weather_wind"]] = ["Roof Closed", 0.0, "0 mph, None"]
     for c in ("home_score", "away_score", "venue_id"):
         g[c] = g[c].astype("Int64")
     return g[SCHEDULE_COLUMNS]
+
+
+ROOF_CLOSED_GAME_PK = 2001
 
 
 @pytest.fixture(scope="session")

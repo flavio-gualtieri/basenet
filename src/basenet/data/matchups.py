@@ -46,7 +46,11 @@ import pandas as pd
 
 from . import config
 from . import paths
-from .features import HITTER_FEATURE_COLUMNS, PITCHER_FEATURE_COLUMNS, PITCHER_STATE_COLUMNS
+from .features import (
+    HITTER_FEATURE_COLUMNS, HITTER_PLATOON_COLUMNS, HITTER_PLATOON_STATS, PITCHER_FEATURE_COLUMNS,
+    PITCHER_PLATOON_COLUMNS, PITCHER_PLATOON_STATS, PITCHER_STATE_COLUMNS, PITCHER_WORKLOAD_COLUMNS,
+)
+from .pa import load_played_schedule
 from .paths import ensure_dir, interim_pa_season_dir, raw_statcast_season_dir, StageTimer
 
 GROUP_KEY = "game_pk"  # never split at row level -- see module docstring
@@ -441,6 +445,105 @@ def resolve_bullpen_set(bullpen_df: pd.DataFrame, pitcher_post_game: pd.DataFram
 
 
 # ---------------------------------------------------------------------------
+# Matchup-specific platoon splits + schedule / weather context
+# ---------------------------------------------------------------------------
+
+def resolve_matchup_platoon(df: pd.DataFrame) -> pd.DataFrame:
+    """player_daily stores each player's split vs BOTH hands; a matchup needs
+    one. Per lineup slot:
+      slot{k}_plat_{stat}     the hitter's rate vs today's starter's hand
+      slot{k}_sp_plat_{stat}  today's starter's rate vs this hitter's side
+    (`slot{k}_stands` is the side he actually batted from against this
+    starter, so a switch-hitter resolves correctly). The both-hands source
+    columns are dropped.
+    """
+    for col in ["sp_throws"] + [f"slot{k}_stands" for k in range(1, N_SLOTS + 1)]:
+        bad = set(df[col].dropna().unique()) - {"L", "R"}
+        if bad:
+            raise ValueError(f"[matchups] unexpected hand value(s) {bad} in {col}")
+    sp_is_l = (df["sp_throws"] == "L").to_numpy()
+    new = {}
+    for k in range(1, N_SLOTS + 1):
+        for s in HITTER_PLATOON_STATS:
+            new[f"slot{k}_plat_{s}"] = np.where(sp_is_l, df[f"slot{k}_plat_vs_l_{s}"], df[f"slot{k}_plat_vs_r_{s}"])
+        hitter_is_l = (df[f"slot{k}_stands"] == "L").to_numpy()
+        for s in PITCHER_PLATOON_STATS:
+            new[f"slot{k}_sp_plat_{s}"] = np.where(hitter_is_l, df[f"sp_plat_vs_l_{s}"], df[f"sp_plat_vs_r_{s}"])
+    source = [c for c in df.columns if "plat_vs_" in c]
+    return pd.concat([df.drop(columns=source), pd.DataFrame(new, index=df.index)], axis=1)
+
+
+SCHEDULE_CONTEXT_COLUMNS: list[str] = [
+    "is_day_game",
+    "bat_days_since_last_game", "pit_days_since_last_game",
+    "bat_traveled", "pit_traveled",
+    "bat_day_after_night", "pit_day_after_night",
+]
+WEATHER_CONTEXT_COLUMNS: list[str] = ["temp_f", "wind_out_mph", "wind_in_mph", "is_indoor", "is_precip"]
+
+
+def _team_schedule_features(pa: pd.DataFrame, day_night: pd.Series) -> pd.DataFrame:
+    """Per (game_pk, team): days since the team's previous game this season
+    (0 = second game of a doubleheader; capped at TEAM_REST_DAYS_CAP, which
+    is also the season-opener value), whether it changed venue since that
+    game, and whether this is a day game the day after a night game. All
+    known pre-game. Built from every game in `pa` -- including ones dropped
+    later for incomplete lineups, which still happened."""
+    tg = pa[["game_pk", "game_date", "batting_team", "venue_id"]].drop_duplicates(["game_pk", "batting_team"])
+    tg = tg.rename(columns={"batting_team": "team"})
+    tg["day_night"] = tg["game_pk"].map(day_night)
+    tg = tg.sort_values(["team", "game_date", "game_pk"])
+    g = tg.groupby("team")
+    prev_date, prev_venue, prev_dn = g["game_date"].shift(1), g["venue_id"].shift(1), g["day_night"].shift(1)
+    gap = (tg["game_date"] - prev_date).dt.days
+    tg["days_since_last_game"] = gap.fillna(config.TEAM_REST_DAYS_CAP).clip(upper=config.TEAM_REST_DAYS_CAP)
+    tg["traveled"] = (prev_venue.notna() & (prev_venue != tg["venue_id"])).astype(float)
+    tg["day_after_night"] = ((tg["day_night"] == "day") & (prev_dn == "night") & (gap == 1)).astype(float)
+    return tg[["game_pk", "team", "days_since_last_game", "traveled", "day_after_night"]]
+
+
+def parse_weather(sched: pd.DataFrame) -> pd.DataFrame:
+    """StatsAPI weather strings -> numbers, one row per game_pk. Wind
+    ("8 mph, Out To CF", "5 mph, In From LF", "L To R", "Calm", "Varies")
+    becomes mph blowing out / in (cross, calm and varying count as neither);
+    indoors (dome, roof closed) zeroes the wind. A missing or placeholder
+    temperature (config.MIN_PLAUSIBLE_TEMP_F) becomes config.DEFAULT_TEMP_F."""
+    wind = sched["weather_wind"].fillna("")
+    mph = pd.to_numeric(wind.str.extract(r"(\d+)\s*mph")[0], errors="coerce").fillna(0.0)
+    direction = wind.str.split(", ", n=1).str[1].fillna("")
+    indoor = sched["weather_condition"].isin(config.WEATHER_INDOOR_CONDITIONS)
+    return pd.DataFrame({
+        "game_pk": sched["game_pk"].to_numpy(),
+        "temp_f": sched["weather_temp"].where(sched["weather_temp"] >= config.MIN_PLAUSIBLE_TEMP_F)
+                  .fillna(config.DEFAULT_TEMP_F).to_numpy(dtype=float),
+        "wind_out_mph": np.where(direction.str.startswith("Out") & ~indoor, mph, 0.0),
+        "wind_in_mph": np.where(direction.str.startswith("In") & ~indoor, mph, 0.0),
+        "is_indoor": indoor.to_numpy(dtype=float),
+        "is_precip": sched["weather_condition"].isin(config.WEATHER_PRECIP_CONDITIONS).to_numpy(dtype=float),
+    })
+
+
+def schedule_context(pa: pd.DataFrame, seasons: list[int]) -> pd.DataFrame:
+    """SCHEDULE_CONTEXT_COLUMNS + WEATHER_CONTEXT_COLUMNS per (game_pk,
+    batting_team), from the StatsAPI schedule snapshot (raw, no network).
+    `bat_*` describe the batting team, `pit_*` its opponent. Weather is the
+    official first-pitch report -- see the caveat in ingest.SCHEDULE_COLUMNS."""
+    sched = pd.concat([load_played_schedule(s) for s in seasons], ignore_index=True)
+    day_night = sched.set_index("game_pk")["day_night"]
+    team = _team_schedule_features(pa, day_night)
+    games = pa[["game_pk", "batting_team", "pitching_team"]].drop_duplicates(["game_pk", "batting_team"])
+    out = games.merge(team.rename(columns={"team": "batting_team", "days_since_last_game": "bat_days_since_last_game",
+                                           "traveled": "bat_traveled", "day_after_night": "bat_day_after_night"}),
+                      on=["game_pk", "batting_team"], how="left", validate="one_to_one")
+    out = out.merge(team.rename(columns={"team": "pitching_team", "days_since_last_game": "pit_days_since_last_game",
+                                         "traveled": "pit_traveled", "day_after_night": "pit_day_after_night"}),
+                    on=["game_pk", "pitching_team"], how="left", validate="one_to_one")
+    out["is_day_game"] = (out["game_pk"].map(day_night) == "day").astype(float)
+    out = out.merge(parse_weather(sched), on="game_pk", how="left", validate="many_to_one")
+    return out[["game_pk", "batting_team"] + SCHEDULE_CONTEXT_COLUMNS + WEATHER_CONTEXT_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
@@ -501,7 +604,7 @@ def build_matchups(seasons: list[int]) -> pd.DataFrame:
         )
         resolved = _resolve_exact(
             merged[["game_pk", "batting_team", "game_date", "batter_id", "batter_stands"]],
-            "batter_id", player_daily, "hitter", HITTER_FEATURE_COLUMNS, f"slot{slot}_",
+            "batter_id", player_daily, "hitter", HITTER_FEATURE_COLUMNS + HITTER_PLATOON_COLUMNS, f"slot{slot}_",
         )
         resolved = resolved.rename(columns={"batter_id": f"slot{slot}_batter_id",
                                              "batter_stands": f"slot{slot}_stands"})
@@ -521,7 +624,7 @@ def build_matchups(seasons: list[int]) -> pd.DataFrame:
         resolved = resolved.merge(game_pk_expected_pa, on="game_pk", how="left")
         resolved = resolved.rename(columns={"expected_pa": f"slot{slot}_expected_pa"})
         keep_cols = [f"slot{slot}_batter_id", f"slot{slot}_stands", f"slot{slot}_expected_pa"] + \
-                    [f"slot{slot}_{c}" for c in HITTER_FEATURE_COLUMNS]
+                    [f"slot{slot}_{c}" for c in HITTER_FEATURE_COLUMNS + HITTER_PLATOON_COLUMNS]
         per_slot_frames.append(resolved[keep_cols])
 
     result = base.reset_index(drop=True)
@@ -536,11 +639,15 @@ def build_matchups(seasons: list[int]) -> pd.DataFrame:
     )
     sp_resolved = _resolve_exact(
         sp_merged[["game_pk", "pitching_team", "game_date", "pitcher_id", "pitcher_throws"]],
-        "pitcher_id", player_daily, "pitcher", PITCHER_FEATURE_COLUMNS, "sp_",
+        "pitcher_id", player_daily, "pitcher",
+        PITCHER_FEATURE_COLUMNS + PITCHER_PLATOON_COLUMNS + PITCHER_WORKLOAD_COLUMNS, "sp_",
     )
     sp_resolved = sp_resolved.rename(columns={"pitcher_id": "sp_id", "pitcher_throws": "sp_throws"})
-    sp_cols = ["sp_id", "sp_throws"] + [f"sp_{c}" for c in PITCHER_FEATURE_COLUMNS]
+    sp_cols = ["sp_id", "sp_throws"] + [
+        f"sp_{c}" for c in PITCHER_FEATURE_COLUMNS + PITCHER_PLATOON_COLUMNS + PITCHER_WORKLOAD_COLUMNS
+    ]
     result = pd.concat([result, sp_resolved[sp_cols].reset_index(drop=True)], axis=1)
+    result = resolve_matchup_platoon(result)
 
     # --- bullpen: individual masked/weighted pitcher slots, not a composite
     # (see resolve_bullpen_set docstring -- this is the set PitcherEncoder
@@ -572,6 +679,8 @@ def build_matchups(seasons: list[int]) -> pd.DataFrame:
     lineup_id_cols = [f"slot{s}_batter_id" for s in range(1, N_SLOTS + 1)]
     result["lineup_player_ids"] = result[lineup_id_cols].values.tolist()
 
+    result = result.merge(schedule_context(pa, seasons), on=["game_pk", "batting_team"], how="left",
+                          validate="many_to_one")
     return result
 
 

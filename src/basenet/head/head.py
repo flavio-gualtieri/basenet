@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+
+from ..distributions import DISTRIBUTIONS, Distribution, nll
 
 
 @dataclass(frozen=True)
@@ -19,8 +22,14 @@ class HeadConfig:
     log_lambda_min: float = -5.0
     log_lambda_max: float = 4.0
     park_embedding_dim: int = 4  # learned park vector concatenated onto the head input
+    # Run-count distribution around the predicted mean: "poisson" (variance =
+    # mean) or "negbin" (one learned, global dispersion r: variance = mean +
+    # mean^2 / r). See basenet.distributions.
+    distribution: Distribution = "poisson"
 
     def __post_init__(self) -> None:
+        if self.distribution not in DISTRIBUTIONS:
+            raise ValueError(f"distribution must be one of {DISTRIBUTIONS}, got {self.distribution!r}")
         if not self.hidden_dims:
             raise ValueError("hidden_dims must contain at least one layer")
         if self.park_embedding_dim < 0:
@@ -32,12 +41,16 @@ class HeadConfig:
 
 
 class ScoreHead(nn.Module):
-    """Maps encoded hitters, pitchers, and game context to a Poisson rate.
+    """Maps encoded hitters, pitchers, and game context to expected runs,
+    plus (for distribution="negbin") a global dispersion.
 
-    The forward pass returns **log-lambda**, not runs. This is deliberate:
-    the Poisson NLL consumes the log rate directly, and predicting in log
-    space means the network can emit any real number while the implied rate
-    stays positive. Use predict_runs() to obtain expected runs.
+    The forward pass returns **log-lambda** (log expected runs), not runs.
+    This is deliberate: the NLL consumes the log mean directly, and
+    predicting in log space means the network can emit any real number while
+    the implied mean stays positive. Use predict_runs() to obtain expected
+    runs. The mean is the same quantity under either distribution; negbin
+    only widens the distribution around it via `log_r` (a learned scalar,
+    stored as a log so r stays positive).
 
     Shapes
     ------
@@ -52,9 +65,16 @@ class ScoreHead(nn.Module):
         self.cfg = cfg
         self.in_dim = in_dim
         self.net = self._build_net(in_dim, cfg)
-        self.criterion = nn.PoissonNLLLoss(
-            log_input=True, full=False, reduction="mean"
-        )
+        if cfg.distribution == "negbin":
+            # r = 5 to start (variance ~ 1.9x the mean at 4.5 runs); learned from there.
+            self.log_r = nn.Parameter(torch.tensor(math.log(5.0)))
+        else:
+            self.register_parameter("log_r", None)
+
+    @property
+    def dispersion(self) -> float | None:
+        """The learned negbin dispersion r, or None for a Poisson head."""
+        return None if self.log_r is None else float(torch.exp(self.log_r.detach()))
 
     @staticmethod
     def _build_net(in_dim: int, cfg: HeadConfig) -> nn.Module:
@@ -93,11 +113,12 @@ class ScoreHead(nn.Module):
         return torch.exp(self(hitter_vec, pitcher_vec, context))
 
     def loss(self, log_lambda: torch.Tensor, runs: torch.Tensor) -> torch.Tensor:
-        """Poisson NLL. Expects log-lambda from forward(), not runs."""
+        """Full NLL (nats/team-game, including log y!) under cfg.distribution.
+        Expects log-lambda from forward(), not runs."""
         if log_lambda.shape != runs.shape:
             raise ValueError(
                 f"shape mismatch: log_lambda {tuple(log_lambda.shape)} vs "
                 f"runs {tuple(runs.shape)} — broadcasting would silently "
                 f"produce an (B, B) loss matrix"
             )
-        return self.criterion(log_lambda, runs.float())
+        return nll(log_lambda, runs, self.cfg.distribution, self.log_r)

@@ -19,3 +19,12 @@ model:
     log_lambda_min: -5.0
     log_lambda_max: 4.0
     park_embedding_dim: 4
+    distribution: negbin  # poisson | negbin -- see basenet/distributions.py; negbin chosen on val (2024)
+
+features:
+  # optional feature groups (see basenet/data/datasets.py FEATURE_GROUPS):
+  # contact, platoon, workload, schedule, weather. [] = base features only.
+  # platoon + weather chosen on val (2024, 3 seeds): the two groups that
+  # helped both BaseNet and the GLM on their own; adding contact, workload
+  # and schedule on top was within seed noise.
+  groups: [platoon, weather]

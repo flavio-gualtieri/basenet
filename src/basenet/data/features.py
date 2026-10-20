@@ -59,19 +59,48 @@ ORDER_KEY = "game_date, game_pk, at_bat_number"
 # Non-id columns present on every `player_daily` row, per role -- exported so
 # matchups.py / datasets.py build their column lists off these instead of
 # duplicating them (see _finalize_hitter_daily / _finalize_pitcher_daily).
+HITTER_BASE_STATS = ("k_pct", "bb_pct", "hbp_pct", "x1b_rate", "x2b_rate",
+                     "x3b_rate", "hr_rate", "babip", "gb_pct", "fb_pct")
+PITCHER_BASE_STATS = ("k_pct", "bb_pct", "hr_per_bf", "gb_pct", "contact_pct", "whiff_pct")
+# Quality of contact (for hitters: produced; for pitchers: allowed) -- the
+# "contact" feature group (see datasets.FEATURE_GROUPS).
+CONTACT_STATS = ("xwoba", "hard_hit_pct", "barrel_pct")
+
+HITTER_CONTACT_COLUMNS: list[str] = [f"{w}_{s}" for w in ("std", "trailing") for s in CONTACT_STATS]
+PITCHER_CONTACT_COLUMNS: list[str] = list(HITTER_CONTACT_COLUMNS)
+
 HITTER_FEATURE_COLUMNS: list[str] = (
     ["std_pa", "trailing_pa", "is_cold_start", "days_since_last_game"]
-    + [f"std_{s}" for s in ("k_pct", "bb_pct", "hbp_pct", "x1b_rate", "x2b_rate",
-                             "x3b_rate", "hr_rate", "babip", "gb_pct", "fb_pct")]
-    + [f"trailing_{s}" for s in ("k_pct", "bb_pct", "hbp_pct", "x1b_rate", "x2b_rate",
-                                  "x3b_rate", "hr_rate", "babip", "gb_pct", "fb_pct")]
+    + [f"std_{s}" for s in HITTER_BASE_STATS]
+    + [f"trailing_{s}" for s in HITTER_BASE_STATS]
+    + HITTER_CONTACT_COLUMNS
 )
 PITCHER_FEATURE_COLUMNS: list[str] = (
     ["std_bf", "trailing_bf", "is_cold_start", "days_rest",
      "pitch_count_last_outing", "pitch_count_trailing_3d"]
-    + [f"std_{s}" for s in ("k_pct", "bb_pct", "hr_per_bf", "gb_pct", "contact_pct", "whiff_pct")]
-    + [f"trailing_{s}" for s in ("k_pct", "bb_pct", "hr_per_bf", "gb_pct", "contact_pct", "whiff_pct")]
+    + [f"std_{s}" for s in PITCHER_BASE_STATS]
+    + [f"trailing_{s}" for s in PITCHER_BASE_STATS]
+    + PITCHER_CONTACT_COLUMNS
 )
+
+# Platoon splits ("platoon" group): rates vs each opposing hand, over every
+# earlier PA in the ingested window, shrunk toward the player's own overall
+# rate (see _attach_platoon). Stored for both hands; matchups.py picks the
+# one that applies to each matchup (hitter vs today's starter's hand, starter
+# vs each hitter's side). Not part of *_FEATURE_COLUMNS: they're resolved
+# per matchup, not per player.
+HITTER_PLATOON_STATS = ("k_pct", "bb_pct", "hr_rate", "xwoba")
+PITCHER_PLATOON_STATS = ("k_pct", "bb_pct", "hr_per_bf", "xwoba")
+HITTER_PLATOON_COLUMNS: list[str] = [f"plat_vs_{h}_{s}" for h in ("l", "r") for s in HITTER_PLATOON_STATS]
+PITCHER_PLATOON_COLUMNS: list[str] = [f"plat_vs_{h}_{s}" for h in ("l", "r") for s in PITCHER_PLATOON_STATS]
+
+# What matchups.resolve_matchup_platoon leaves per lineup slot (slot{k}_...):
+# the hitter's split vs today's starter's hand, then the starter's vs his side.
+SLOT_PLATOON_COLUMNS: list[str] = ([f"plat_{s}" for s in HITTER_PLATOON_STATS]
+                                   + [f"sp_plat_{s}" for s in PITCHER_PLATOON_STATS])
+
+# Starter workload ("workload" group), pitcher rows only: see _attach_workload.
+PITCHER_WORKLOAD_COLUMNS: list[str] = ["n_recent_starts", "bf_per_start"]
 # Fatigue/recency features are relative to the *target* game's date, so for
 # a reliever who isn't pitching in that game they can't be read off any
 # stored row -- matchups.py recomputes them per target game (same
@@ -92,6 +121,9 @@ HITTER_STAT_SPECS: dict[str, tuple[str, str]] = {
     "babip": ("babip_hit", "babip_bip"),
     "gb_pct": ("gb", "bip_typed"),
     "fb_pct": ("fb", "bip_typed"),
+    "xwoba": ("xwoba_num", "woba_den"),
+    "hard_hit_pct": ("hard_hit", "ev_bip"),
+    "barrel_pct": ("barrel", "ev_bip"),
 }
 PITCHER_STAT_SPECS: dict[str, tuple[str, str]] = {
     "k_pct": ("k", "bf"),
@@ -100,6 +132,9 @@ PITCHER_STAT_SPECS: dict[str, tuple[str, str]] = {
     "gb_pct": ("gb", "bip_typed"),
     "contact_pct": ("contact", "swings"),
     "whiff_pct": ("whiffs", "swings"),
+    "xwoba": ("xwoba_num", "woba_den"),
+    "hard_hit_pct": ("hard_hit", "ev_bip"),
+    "barrel_pct": ("barrel", "ev_bip"),
 }
 
 HITTER_INDICATOR_SQL: dict[str, str] = {
@@ -116,15 +151,23 @@ HITTER_INDICATOR_SQL: dict[str, str] = {
     "bip_typed": "CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END",
     "gb": "CASE WHEN bb_type='ground_ball' THEN 1 ELSE 0 END",
     "fb": "CASE WHEN bb_type='fly_ball' THEN 1 ELSE 0 END",
+    # xwOBA: statcast's expected wOBA from exit velocity + launch angle on
+    # balls in play, the actual wOBA value otherwise (K, BB, HBP -- and the
+    # rare batted ball with no tracked EV), over wOBA's own denominator
+    # (excludes sac bunts, catcher's interference, ...).
+    "xwoba_num": ("CASE WHEN woba_denom = 1 THEN COALESCE("
+                  "CASE WHEN bb_type IS NOT NULL THEN xwoba_contact END, woba_value, 0) ELSE 0 END"),
+    "woba_den": "COALESCE(woba_denom, 0)",
+    "ev_bip": "CASE WHEN bb_type IS NOT NULL AND launch_speed IS NOT NULL THEN 1 ELSE 0 END",
+    "hard_hit": f"CASE WHEN bb_type IS NOT NULL AND launch_speed >= {config.HARD_HIT_MPH} THEN 1 ELSE 0 END",
+    "barrel": (f"CASE WHEN bb_type IS NOT NULL AND launch_speed_angle = {config.BARREL_LAUNCH_SPEED_ANGLE} "
+               f"THEN 1 ELSE 0 END"),
 }
 # Pitcher PA-level indicators are a subset of the same outcome vocabulary,
 # just grouped by pitcher_id instead of batter_id.
 PITCHER_INDICATOR_SQL: dict[str, str] = {
-    "k": HITTER_INDICATOR_SQL["k"],
-    "bb": HITTER_INDICATOR_SQL["bb"],
-    "hr": HITTER_INDICATOR_SQL["hr"],
-    "bip_typed": HITTER_INDICATOR_SQL["bip_typed"],
-    "gb": HITTER_INDICATOR_SQL["gb"],
+    name: HITTER_INDICATOR_SQL[name]
+    for name in ("k", "bb", "hr", "bip_typed", "gb", "xwoba_num", "woba_den", "ev_bip", "hard_hit", "barrel")
 }
 
 
@@ -394,6 +437,107 @@ def _apply_shrinkage(df: pd.DataFrame, specs: dict[str, tuple[str, str]],
         df[f"{window}_{stat}"] = (numerator + k * league) / (n + k)
 
 
+# ---------------------------------------------------------------------------
+# Platoon splits + starter workload (pre-game rows only)
+# ---------------------------------------------------------------------------
+
+# Per-PA indicators the platoon windows need ("n" = one PA / batter faced),
+# and each platoon stat's (numerator, denominator) in those terms.
+_PLATOON_INDICATOR_SQL: dict[str, str] = {
+    "n": "1", **{k: HITTER_INDICATOR_SQL[k] for k in ("k", "bb", "hr", "xwoba_num", "woba_den")},
+}
+_PLATOON_NUM_DEN: dict[str, tuple[str, str]] = {
+    "k_pct": ("k", "n"), "bb_pct": ("bb", "n"), "hr_rate": ("hr", "n"), "hr_per_bf": ("hr", "n"),
+    "xwoba": ("xwoba_num", "woba_den"),
+}
+
+
+def _platoon_counts(con: duckdb.DuckDBPyConnection, player_col: str, hand_col: str) -> pd.DataFrame:
+    """Per (player_id, game_pk): cumulative indicator counts vs each opposing
+    hand (`hand_col`: pitcher_throws for hitters, batter_stands for
+    pitchers) over every PA strictly before this game -- the whole ingested
+    window, not one season (splits need the sample). Read at the game's
+    first PA, like the pre-game STD window."""
+    cols = ", ".join(
+        f"COALESCE(SUM(CASE WHEN opp_hand = '{hand}' THEN {sql} ELSE 0 END) OVER (PARTITION BY player_id "
+        f"ORDER BY {ORDER_KEY} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS vs_{hand.lower()}_{name}"
+        for name, sql in _PLATOON_INDICATOR_SQL.items() for hand in ("L", "R")
+    )
+    return con.execute(f"""
+        WITH facts AS (SELECT {player_col} AS player_id, {hand_col} AS opp_hand, * FROM pa),
+        windowed AS (
+            SELECT player_id, game_pk, {cols},
+                ROW_NUMBER() OVER (PARTITION BY player_id, game_pk ORDER BY at_bat_number) AS _rn
+            FROM facts
+        )
+        SELECT * EXCLUDE (_rn) FROM windowed WHERE _rn = 1
+    """).df()
+
+
+def _attach_platoon(con: duckdb.DuckDBPyConnection, daily: pd.DataFrame, role: str) -> pd.DataFrame:
+    """Adds plat_vs_{l,r}_{stat}: the rate vs that hand, shrunk toward the
+    player's own overall rate over the same window with
+    config.PLATOON_SHRINKAGE_K -- which is itself shrunk toward the running
+    league rate (`league_{stat}`, already on `daily`) with the stat's usual
+    k. A player with no PAs vs a hand gets his overall rate; one with no PAs
+    at all gets the league rate."""
+    if role == "hitter":
+        player_col, hand_col, stats, shrink_k = "batter_id", "pitcher_throws", HITTER_PLATOON_STATS, config.HITTER_SHRINKAGE_K
+    else:
+        player_col, hand_col, stats, shrink_k = "pitcher_id", "batter_stands", PITCHER_PLATOON_STATS, config.PITCHER_SHRINKAGE_K
+    counts = _platoon_counts(con, player_col, hand_col)
+    daily = daily.merge(counts, on=["player_id", "game_pk"], how="left")
+    kp = config.PLATOON_SHRINKAGE_K
+    for stat in stats:
+        num, den = _PLATOON_NUM_DEN[stat]
+        l_num, r_num = daily[f"vs_l_{num}"].fillna(0), daily[f"vs_r_{num}"].fillna(0)
+        l_den, r_den = daily[f"vs_l_{den}"].fillna(0), daily[f"vs_r_{den}"].fillna(0)
+        k = shrink_k[stat]
+        overall = (l_num + r_num + k * daily[f"league_{stat}"]) / (l_den + r_den + k)
+        daily[f"plat_vs_l_{stat}"] = (l_num + kp * overall) / (l_den + kp)
+        daily[f"plat_vs_r_{stat}"] = (r_num + kp * overall) / (r_den + kp)
+    return daily.drop(columns=[c for c in counts.columns if c.startswith("vs_")])
+
+
+def _attach_workload(con: duckdb.DuckDBPyConnection, daily: pd.DataFrame) -> pd.DataFrame:
+    """Adds n_recent_starts / bf_per_start to pitcher rows: batters faced per
+    start over the pitcher's last STARTER_BF_LOOKBACK_STARTS starts strictly
+    before this game (any season), shrunk toward STARTER_BF_PRIOR with
+    STARTER_BF_PRIOR_K starts. A start = the first pitcher his team used in a
+    game (an opener counts, and his short outings pull the estimate down --
+    which is the point)."""
+    n = config.STARTER_BF_LOOKBACK_STARTS
+    df = con.execute(f"""
+        WITH app AS (
+            SELECT pitcher_id AS player_id, game_pk, game_date, pitching_team, COUNT(*) AS bf
+            FROM pa GROUP BY 1, 2, 3, 4
+        ),
+        first_pitcher AS (
+            SELECT game_pk, pitching_team, arg_min(pitcher_id, at_bat_number) AS sp_id FROM pa GROUP BY 1, 2
+        ),
+        starts AS (
+            SELECT a.player_id, a.game_pk, a.game_date, a.bf FROM app a
+            JOIN first_pitcher f ON f.game_pk = a.game_pk AND f.pitching_team = a.pitching_team
+                                AND f.sp_id = a.player_id
+        ),
+        prior AS (
+            SELECT a.player_id, a.game_pk, s.bf,
+                   ROW_NUMBER() OVER (PARTITION BY a.player_id, a.game_pk
+                                      ORDER BY s.game_date DESC, s.game_pk DESC) AS rk
+            FROM app a JOIN starts s
+              ON s.player_id = a.player_id
+             AND (s.game_date < a.game_date OR (s.game_date = a.game_date AND s.game_pk < a.game_pk))
+        )
+        SELECT player_id, game_pk, COUNT(*) AS n_recent_starts, SUM(bf) AS _bf_sum
+        FROM prior WHERE rk <= {n} GROUP BY 1, 2
+    """).df()
+    daily = daily.merge(df, on=["player_id", "game_pk"], how="left")
+    daily["n_recent_starts"] = daily["n_recent_starts"].fillna(0)
+    k = config.STARTER_BF_PRIOR_K
+    daily["bf_per_start"] = (daily["_bf_sum"].fillna(0) + k * config.STARTER_BF_PRIOR) / (daily["n_recent_starts"] + k)
+    return daily.drop(columns="_bf_sum")
+
+
 def _finalize_hitter_daily(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     daily = _build_hitter_daily(con)
     league = _daily_league_means(con, "batter_id", HITTER_INDICATOR_SQL, role="hitter", n_alias="pa")
@@ -402,6 +546,7 @@ def _finalize_hitter_daily(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
     _apply_shrinkage(daily, HITTER_STAT_SPECS, config.HITTER_SHRINKAGE_K, "std")
     _apply_shrinkage(daily, HITTER_STAT_SPECS, config.HITTER_SHRINKAGE_K, "trailing")
+    daily = _attach_platoon(con, daily, "hitter")
 
     # No PAs anywhere in the ingested window -- a true debut (or first
     # appearance since the window starts). NOT std_pa == 0, which is every
@@ -418,6 +563,7 @@ def _finalize_hitter_daily(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     keep = ["player_id", "role", "game_pk", "game_date", "season", "std_pa", "trailing_pa",
             "is_cold_start", "days_since_last_game"]
     keep += [f"std_{s}" for s in HITTER_STAT_SPECS] + [f"trailing_{s}" for s in HITTER_STAT_SPECS]
+    keep += HITTER_PLATOON_COLUMNS
     return daily[keep]
 
 
@@ -497,10 +643,13 @@ def _finalize_pitcher_daily(con: duckdb.DuckDBPyConnection,
     daily["pitch_count_last_outing"] = daily["pitch_count_last_outing"].fillna(0)
     daily["pitch_count_trailing_3d"] = daily["pitch_count_trailing_3d"].fillna(0)
     daily["days_rest"] = daily["days_rest"].fillna(config.DEFAULT_DAYS_REST)
+    daily = _attach_platoon(con, daily, "pitcher")
+    daily = _attach_workload(con, daily)
 
     keep = ["player_id", "role", "game_pk", "game_date", "season", "std_bf", "trailing_bf",
             "is_cold_start", "days_rest", "pitch_count_last_outing", "pitch_count_trailing_3d"]
     keep += [f"std_{s}" for s in PITCHER_STAT_SPECS] + [f"trailing_{s}" for s in PITCHER_STAT_SPECS]
+    keep += PITCHER_PLATOON_COLUMNS + PITCHER_WORKLOAD_COLUMNS
     return daily[keep]
 
 

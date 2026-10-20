@@ -48,7 +48,11 @@ import pandas as pd
 
 from . import config
 from . import paths
-from .features import HITTER_FEATURE_COLUMNS, PITCHER_FEATURE_COLUMNS
+from .features import (
+    HITTER_CONTACT_COLUMNS, HITTER_FEATURE_COLUMNS, PITCHER_CONTACT_COLUMNS, PITCHER_FEATURE_COLUMNS,
+    SLOT_PLATOON_COLUMNS,
+)
+from .matchups import SCHEDULE_CONTEXT_COLUMNS, WEATHER_CONTEXT_COLUMNS
 from .paths import ensure_dir
 
 HAND_MAP = {"L": -1.0, "R": 1.0, "S": 0.0}
@@ -60,10 +64,56 @@ CONTEXT_FEATURES = [
 
 K_PITCHERS = 1 + config.MAX_BULLPEN_SIZE  # starter + bullpen slots
 
-# +1 for the numeric handedness channel appended to every hitter/pitcher vector.
-F_HITTER = len(HITTER_FEATURE_COLUMNS) + 1 + 1  # + expected_pa + handedness
-F_PITCHER = len(PITCHER_FEATURE_COLUMNS) + 1    # + handedness
-F_CONTEXT = len(CONTEXT_FEATURES)
+# Optional feature groups, switched on in configs.yaml (`features.groups`).
+# The pipeline always computes every column; these only choose which reach
+# the tensors, so a group can be evaluated (or dropped) without a rebuild.
+FEATURE_GROUPS: dict[str, str] = {
+    "contact": "quality of contact: xwOBA / hard-hit / barrel rates (hitters produced, pitchers allowed)",
+    "platoon": "per lineup slot: hitter's split vs the starter's hand + starter's split vs the hitter's side",
+    "workload": "starter's recent batters faced per start: a context feature + sets SP/bullpen innings weights",
+    "schedule": "day game, each team's days since last game, venue change, day-after-night",
+    "weather": "game-time temperature, wind blowing out / in, indoors, precipitation",
+}
+
+
+def validate_groups(groups) -> tuple[str, ...]:
+    groups = tuple(sorted(set(groups)))
+    unknown = set(groups) - set(FEATURE_GROUPS)
+    if unknown:
+        raise ValueError(f"unknown feature group(s) {sorted(unknown)}; known: {sorted(FEATURE_GROUPS)}")
+    return groups
+
+
+def hitter_columns(groups=()) -> list[str]:
+    """Per-slot hitter channels, before the expected_pa and handedness channels."""
+    groups = validate_groups(groups)
+    cols = [c for c in HITTER_FEATURE_COLUMNS if "contact" in groups or c not in HITTER_CONTACT_COLUMNS]
+    return cols + (SLOT_PLATOON_COLUMNS if "platoon" in groups else [])
+
+
+def pitcher_columns(groups=()) -> list[str]:
+    """Per-pitcher channels (starter and bullpen alike), before handedness."""
+    groups = validate_groups(groups)
+    return [c for c in PITCHER_FEATURE_COLUMNS if "contact" in groups or c not in PITCHER_CONTACT_COLUMNS]
+
+
+def context_columns(groups=()) -> list[str]:
+    groups = validate_groups(groups)
+    return (CONTEXT_FEATURES
+            + (["sp_bf_per_start"] if "workload" in groups else [])
+            + (SCHEDULE_CONTEXT_COLUMNS if "schedule" in groups else [])
+            + (WEATHER_CONTEXT_COLUMNS if "weather" in groups else []))
+
+
+def feature_dims(groups=()) -> tuple[int, int, int]:
+    """(F_h, F_p, F_c) for these groups -- the model's input widths."""
+    return (len(hitter_columns(groups)) + 2,   # + expected_pa + handedness
+            len(pitcher_columns(groups)) + 1,  # + handedness
+            len(context_columns(groups)))
+
+
+# Widths with no optional groups (the base feature set).
+F_HITTER, F_PITCHER, F_CONTEXT = feature_dims(())
 
 # Tensors the Scaler actually normalizes. Everything else (pa_weights,
 # pitcher_mask, pitcher_weights, y, game_pk) passes through untouched --
@@ -126,8 +176,8 @@ def _encode_hand(series: pd.Series) -> np.ndarray:
     return series.map(HAND_MAP).fillna(0.0).to_numpy(dtype=float)
 
 
-def _hitter_slot_matrix(df: pd.DataFrame, slot: int) -> np.ndarray:
-    cols = [f"slot{slot}_{c}" for c in HITTER_FEATURE_COLUMNS] + [f"slot{slot}_expected_pa"]
+def _hitter_slot_matrix(df: pd.DataFrame, slot: int, groups) -> np.ndarray:
+    cols = [f"slot{slot}_{c}" for c in hitter_columns(groups)] + [f"slot{slot}_expected_pa"]
     arr = df[cols].to_numpy(dtype=float)
     hand = _encode_hand(df[f"slot{slot}_stands"])
     return np.concatenate([arr, hand[:, None]], axis=1)
@@ -138,35 +188,55 @@ def _pa_weights_matrix(df: pd.DataFrame) -> np.ndarray:
     return df[cols].to_numpy(dtype=float)
 
 
-def _sp_vector(df: pd.DataFrame) -> np.ndarray:
-    cols = [f"sp_{c}" for c in PITCHER_FEATURE_COLUMNS]
+def _sp_vector(df: pd.DataFrame, groups) -> np.ndarray:
+    cols = [f"sp_{c}" for c in pitcher_columns(groups)]
     arr = df[cols].to_numpy(dtype=float)
     hand = _encode_hand(df["sp_throws"])
     return np.concatenate([arr, hand[:, None]], axis=1)
 
 
-def _bullpen_slot_vector(df: pd.DataFrame, k: int) -> np.ndarray:
-    cols = [f"bullpen{k}_{c}" for c in PITCHER_FEATURE_COLUMNS]
+def _bullpen_slot_vector(df: pd.DataFrame, k: int, groups) -> np.ndarray:
+    cols = [f"bullpen{k}_{c}" for c in pitcher_columns(groups)]
     arr = df[cols].to_numpy(dtype=float)
     hand = _encode_hand(df[f"bullpen{k}_throws"])
     return np.concatenate([arr, hand[:, None]], axis=1)
 
 
-def build_pitcher_set(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _starter_expected_ip(df: pd.DataFrame) -> np.ndarray:
+    """The starter's recent batters faced per start, in innings, kept inside
+    (1, TEAM_INNINGS_PER_GAME - 1) so neither side of the split vanishes."""
+    ip = df["sp_bf_per_start"].to_numpy(dtype=float) / config.BATTERS_PER_INNING
+    return np.clip(ip, 1.0, config.TEAM_INNINGS_PER_GAME - 1.0)
+
+
+def build_pitcher_set(df: pd.DataFrame, groups=()) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Stacks the starter (always index 0) with config.MAX_BULLPEN_SIZE
     bullpen slots into (N, K, F_p), plus (N, K) mask and (N, K) expected-
     innings weights -- the set PitcherEncoder consumes, replacing what used
     to be a single pre-aggregated composite. See matchups.py's
     resolve_bullpen_set for where the per-slot columns come from.
+
+    Weights: without the "workload" group, a flat config.SP_EXPECTED_IP for
+    every starter and config.BULLPEN_EXPECTED_TOTAL_IP shared by the
+    bullpen. With it, the starter gets his own expected innings (from his
+    recent batters faced per start) and the bullpen the rest of the game.
     """
+    groups = validate_groups(groups)
     n = len(df)
-    vectors = [_sp_vector(df)]
+    if "workload" in groups:
+        sp_ip = _starter_expected_ip(df)
+        bullpen_scale = (config.TEAM_INNINGS_PER_GAME - sp_ip) / config.BULLPEN_EXPECTED_TOTAL_IP
+    else:
+        sp_ip = np.full(n, config.SP_EXPECTED_IP, dtype=float)
+        bullpen_scale = np.ones(n, dtype=float)
+    vectors = [_sp_vector(df, groups)]
     masks = [np.ones(n, dtype=bool)]
-    weights = [np.full(n, config.SP_EXPECTED_IP, dtype=float)]
+    weights = [sp_ip]
     for k in range(1, config.MAX_BULLPEN_SIZE + 1):
-        vectors.append(_bullpen_slot_vector(df, k))
+        vectors.append(_bullpen_slot_vector(df, k, groups))
         masks.append(df[f"bullpen{k}_mask"].to_numpy(dtype=bool))
-        weights.append(df[f"bullpen{k}_ip_share"].to_numpy(dtype=float))
+        # ip_share sums to BULLPEN_EXPECTED_TOTAL_IP over the real slots
+        weights.append(df[f"bullpen{k}_ip_share"].to_numpy(dtype=float) * bullpen_scale)
 
     pitchers = np.stack(vectors, axis=1)   # (N, K, F_p)
     mask = np.stack(masks, axis=1)         # (N, K)
@@ -191,30 +261,41 @@ def _bullpen_cold_start_frac(df: pd.DataFrame) -> np.ndarray:
     return np.where(n_real > 0, frac, 1.0)
 
 
-def _context_matrix(df: pd.DataFrame) -> np.ndarray:
+def _context_matrix(df: pd.DataFrame, groups=()) -> np.ndarray:
+    """Columns in context_columns(groups) order: the five base features
+    (derived here), then any optional-group columns, read as-is."""
     is_home = df["batting_is_home"].astype(float).to_numpy()
     month = pd.to_datetime(df["game_date"]).dt.month.to_numpy(dtype=float)
     sp_cold = df["sp_is_cold_start"].astype(float).to_numpy()
     lineup_cold = df[[f"slot{s}_is_cold_start" for s in range(1, config.N_LINEUP_SLOTS + 1)]] \
         .astype(float).mean(axis=1).to_numpy()
     bullpen_cold = _bullpen_cold_start_frac(df)
-    return np.stack([is_home, month, sp_cold, lineup_cold, bullpen_cold], axis=1)
+    base = np.stack([is_home, month, sp_cold, lineup_cold, bullpen_cold], axis=1)
+    extra = context_columns(groups)[len(CONTEXT_FEATURES):]
+    if not extra:
+        return base
+    return np.concatenate([base, df[extra].to_numpy(dtype=float)], axis=1)
 
 
-def build_tensors(df: pd.DataFrame, park_vocab: dict[str, int] | None = None) -> dict[str, np.ndarray]:
+def build_tensors(df: pd.DataFrame, park_vocab: dict[str, int] | None = None,
+                  groups=()) -> dict[str, np.ndarray]:
+    """See the module docstring; `groups` (FEATURE_GROUPS) picks the optional
+    feature columns -- the same groups must be used for every split and for
+    the model's input widths (feature_dims)."""
+    groups = validate_groups(groups)
     if park_vocab is None:
         park_vocab = build_park_vocab(df)
     lineup = np.stack(
-        [_hitter_slot_matrix(df, s) for s in range(1, config.N_LINEUP_SLOTS + 1)], axis=1
+        [_hitter_slot_matrix(df, s, groups) for s in range(1, config.N_LINEUP_SLOTS + 1)], axis=1
     )
-    pitchers, pitcher_mask, pitcher_weights = build_pitcher_set(df)
+    pitchers, pitcher_mask, pitcher_weights = build_pitcher_set(df, groups)
     return {
         "lineup": lineup,
         "pa_weights": _pa_weights_matrix(df),
         "pitchers": pitchers,
         "pitcher_mask": pitcher_mask,
         "pitcher_weights": pitcher_weights,
-        "context": _context_matrix(df),
+        "context": _context_matrix(df, groups),
         "park": park_index(df, park_vocab),
         "y": df["runs_scored"].to_numpy(dtype=float),
         "game_pk": df["game_pk"].to_numpy(),
@@ -306,7 +387,7 @@ def fit_scaler(train_tensors: dict[str, np.ndarray], park_vocab: dict[str, int])
 
 def fit_and_persist_split(
     seasons_train: list[int], season_val: int, season_test: int,
-    out_dir: Path | None = None,
+    out_dir: Path | None = None, feature_groups=(),
 ) -> Scaler:
     """Computes the chronological split, fits the scaler on the train
     game_pks ONLY, and persists both the split (game_pk lists) and the
@@ -320,7 +401,7 @@ def fit_and_persist_split(
     all_df = load_matchups(seasons_train + [season_val, season_test])
     train_df = all_df[all_df["game_pk"].isin(train_pks)]
     park_vocab = build_park_vocab(train_df)  # train-only, like the scaler
-    train_tensors = build_tensors(train_df, park_vocab)
+    train_tensors = build_tensors(train_df, park_vocab, feature_groups)
     scaler = fit_scaler(train_tensors, park_vocab)
 
     ensure_dir(out_dir)
@@ -328,5 +409,6 @@ def fit_and_persist_split(
     (out_dir / "split.json").write_text(json.dumps({
         "train": sorted(train_pks), "val": sorted(val_pks), "test": sorted(test_pks),
         "seasons_train": seasons_train, "season_val": season_val, "season_test": season_test,
+        "feature_groups": list(validate_groups(feature_groups)),
     }))
     return scaler
